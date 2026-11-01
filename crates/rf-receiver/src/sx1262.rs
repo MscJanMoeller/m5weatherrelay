@@ -1,11 +1,11 @@
 //! SX1262-specific control and diagnostics.
 
-use crate::{FskProfile, PacketInfo};
-use core::ops::RangeInclusive;
+use crate::{CrcConfig, CrcLength, FskProfile, PacketInfo};
+use core::{convert::Infallible, ops::RangeInclusive};
 use embassy_futures::select::{Either, select};
 use embedded_hal::digital::InputPin;
 use embedded_hal_async::{delay::DelayNs, digital::Wait, spi::SpiDevice};
-use regiface::Command;
+use regiface::{Command, ReadableRegister, WritableRegister};
 use sx1262::{
     Device,
     commands::{
@@ -19,8 +19,8 @@ use sx1262::{
         SetRegulatorMode, SetRfFrequency, SetRx, SetStandby, StandbyConfig, TcxoConfig,
         TcxoVoltage,
     },
-    device::{OPCODE_READ_BUFFER, OPCODE_WRITE_REGISTER},
-    registers::SyncWord,
+    device::{OPCODE_READ_BUFFER, OPCODE_READ_REGISTER, OPCODE_WRITE_REGISTER},
+    registers::{CrcInitialValue, CrcPolynomial, SyncWord, WhiteningInitialValue},
 };
 
 pub const IRQ_RX_DONE: u16 = IrqMask::RX_DONE.bits();
@@ -147,8 +147,9 @@ where
             || profile.preamble_bits == 0
             || !SYNC_WORD_BYTES.contains(&sync_word_bytes)
             || profile.packet_length == 0
-            || profile.crc_enabled
-            || profile.whitening_enabled
+            || profile
+                .whitening
+                .is_some_and(|whitening| !WhiteningInitialValue::SEED.contains(&whitening.initial))
         {
             return Err(Error::InvalidProfile);
         }
@@ -213,12 +214,22 @@ where
         .await?;
         let mut sync_word = [0; 8];
         sync_word[..profile.sync_word.len()].copy_from_slice(profile.sync_word);
-        self.run_checked(OPCODE_WRITE_REGISTER, async |device| {
-            device
-                .write_register_async(SyncWord { value: sync_word })
-                .await
-        })
-        .await?;
+        self.write_register(SyncWord { value: sync_word }).await?;
+        if let Some(crc) = &profile.crc {
+            // The datasheet requires the CRC type, initial value and polynomial to change together.
+            self.write_register(CrcInitialValue { value: crc.initial })
+                .await?;
+            self.write_register(CrcPolynomial {
+                value: crc.polynomial,
+            })
+            .await?;
+        }
+        if let Some(whitening) = &profile.whitening {
+            // The 7 MSBs of the register must not change, so the seed is merged into the current value.
+            let register = self.read_register::<WhiteningInitialValue>().await?;
+            self.write_register(register.with_seed(whitening.initial))
+                .await?;
+        }
         self.execute_command(SetPacketParams {
             params: PacketParams::GFSK(GFSKPacketParams {
                 preamble_length: profile.preamble_bits,
@@ -227,8 +238,8 @@ where
                 address_filtering: AddressFiltering::Disable,
                 packet_type: GFSKPacketHeaderType::Fixed,
                 payload_length: profile.packet_length,
-                crc_type: CrcType::CrcOff,
-                whitening_enable: false,
+                crc_type: profile.crc.as_ref().map_or(CrcType::CrcOff, crc_type),
+                whitening_enable: profile.whitening.is_some(),
             }),
         })
         .await?;
@@ -439,6 +450,31 @@ where
         .await
     }
 
+    /// Writes a register between the BUSY wait and the status check.
+    async fn write_register<R>(
+        &mut self,
+        register: R,
+    ) -> Result<(), Error<SPI::Error, BUSY::Error, IRQ::Error>>
+    where
+        R: WritableRegister<IdType = u16, Error = Infallible>,
+    {
+        self.run_checked(OPCODE_WRITE_REGISTER, async |device| {
+            device.write_register_async(register).await
+        })
+        .await
+    }
+
+    /// Reads a register between the BUSY wait and the status check.
+    async fn read_register<R>(&mut self) -> Result<R, Error<SPI::Error, BUSY::Error, IRQ::Error>>
+    where
+        R: ReadableRegister<IdType = u16>,
+    {
+        self.run_checked(OPCODE_READ_REGISTER, async |device| {
+            device.read_register_async::<R>().await
+        })
+        .await
+    }
+
     /// Waits for BUSY, runs one driver operation, then checks the radio status
     /// reported for `opcode`.
     async fn run_checked<T>(
@@ -453,9 +489,19 @@ where
     }
 }
 
+fn crc_type(crc: &CrcConfig) -> CrcType {
+    match (crc.length, crc.inverted) {
+        (CrcLength::OneByte, false) => CrcType::Crc1Byte,
+        (CrcLength::OneByte, true) => CrcType::Crc1ByteInv,
+        (CrcLength::TwoBytes, false) => CrcType::Crc2Byte,
+        (CrcLength::TwoBytes, true) => CrcType::Crc2ByteInv,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WhiteningConfig;
     use embassy_futures::block_on;
     use embedded_hal::{digital, spi};
     use std::{
@@ -478,8 +524,8 @@ mod tests {
         preamble_bits: 48,
         sync_word: &[0x2d, 0xd4],
         packet_length: 64,
-        crc_enabled: false,
-        whitening_enabled: false,
+        crc: None,
+        whitening: None,
     };
 
     struct MockSpi {
@@ -493,6 +539,7 @@ mod tests {
         flags_during_read: u16,
         length: u8,
         offset: u8,
+        whitening_register: u16,
     }
 
     impl Default for MockSpi {
@@ -508,6 +555,7 @@ mod tests {
                 flags_during_read: 0,
                 length: 64,
                 offset: 9,
+                whitening_register: 0x0100,
             }
         }
     }
@@ -587,6 +635,9 @@ mod tests {
                                 *byte = i as u8;
                             }
                             self.irq_flags |= self.flags_during_read;
+                        }
+                        [0x1d, 0x06, 0xb8, 0] => {
+                            data.copy_from_slice(&self.whitening_register.to_be_bytes());
                         }
                         _ => panic!("unexpected read"),
                     }
@@ -839,6 +890,101 @@ mod tests {
     }
 
     #[test]
+    fn writes_crc_settings_before_the_packet_parameters() {
+        block_on(async {
+            let mut radio = radio();
+            radio
+                .init_fsk(&FskProfile {
+                    crc: Some(CrcConfig::CCITT),
+                    ..WS90_868
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                radio.device.spi().commands[10..14],
+                [
+                    vec![0x0d, 0x06, 0xc0, 0x2d, 0xd4, 0, 0, 0, 0, 0, 0],
+                    vec![0x0d, 0x06, 0xbc, 0x1d, 0x0f],
+                    vec![0x0d, 0x06, 0xbe, 0x10, 0x21],
+                    vec![0x8c, 0, 48, 0x05, 16, 0, 0, 64, 0x06, 0],
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn maps_crc_length_and_inversion_to_the_radio_crc_type() {
+        block_on(async {
+            for (length, inverted, crc_type) in [
+                (CrcLength::OneByte, false, 0x00),
+                (CrcLength::TwoBytes, false, 0x02),
+                (CrcLength::OneByte, true, 0x04),
+                (CrcLength::TwoBytes, true, 0x06),
+            ] {
+                let mut radio = radio();
+                radio
+                    .init_fsk(&FskProfile {
+                        crc: Some(CrcConfig {
+                            length,
+                            initial: 0xffff,
+                            polynomial: 0x8005,
+                            inverted,
+                        }),
+                        ..WS90_868
+                    })
+                    .await
+                    .unwrap();
+                let commands = &radio.device.spi().commands;
+                assert!(commands.contains(&vec![0x0d, 0x06, 0xbc, 0xff, 0xff]));
+                assert!(commands.contains(&vec![0x0d, 0x06, 0xbe, 0x80, 0x05]));
+                assert!(commands.contains(&vec![0x8c, 0, 48, 0x05, 16, 0, 0, 64, crc_type, 0]));
+            }
+        });
+    }
+
+    #[test]
+    fn merges_the_whitening_seed_into_the_current_register_value() {
+        block_on(async {
+            let mut radio = radio();
+            radio.device.spi_mut().whitening_register = 0x1234;
+            radio
+                .init_fsk(&FskProfile {
+                    whitening: Some(WhiteningConfig { initial: 0x00a5 }),
+                    ..WS90_868
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                radio.device.spi().commands[10..14],
+                [
+                    vec![0x0d, 0x06, 0xc0, 0x2d, 0xd4, 0, 0, 0, 0, 0, 0],
+                    vec![0x1d, 0x06, 0xb8, 0],
+                    vec![0x0d, 0x06, 0xb8, 0x12, 0xa5],
+                    vec![0x8c, 0, 48, 0x05, 16, 0, 0, 64, 1, 1],
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn default_whitening_and_crc_can_be_combined() {
+        block_on(async {
+            let mut radio = radio();
+            radio
+                .init_fsk(&FskProfile {
+                    crc: Some(CrcConfig::CCITT),
+                    whitening: Some(WhiteningConfig::DEFAULT),
+                    ..WS90_868
+                })
+                .await
+                .unwrap();
+            let commands = &radio.device.spi().commands;
+            assert!(commands.contains(&vec![0x0d, 0x06, 0xb8, 0x01, 0xff]));
+            assert!(commands.contains(&vec![0x8c, 0, 48, 0x05, 16, 0, 0, 64, 0x06, 1]));
+        });
+    }
+
+    #[test]
     fn encodes_profile_boundaries_with_driver_commands() {
         block_on(async {
             for (frequency, bit_rate, deviation) in
@@ -963,11 +1109,11 @@ mod tests {
                     ..WS90_868
                 },
                 FskProfile {
-                    crc_enabled: true,
+                    whitening: Some(WhiteningConfig { initial: 0x0200 }),
                     ..WS90_868
                 },
                 FskProfile {
-                    whitening_enabled: true,
+                    whitening: Some(WhiteningConfig { initial: 0xffff }),
                     ..WS90_868
                 },
             ] {
@@ -1151,6 +1297,16 @@ mod tests {
             radio.device.spi_mut().fail_opcode = Some(0x97);
             assert_eq!(
                 radio.init_fsk(&WS90_868).await,
+                Err(Error::Spi(spi::ErrorKind::Other))
+            );
+            radio.device.spi_mut().fail_opcode = Some(0x1d);
+            assert_eq!(
+                radio
+                    .init_fsk(&FskProfile {
+                        whitening: Some(WhiteningConfig::DEFAULT),
+                        ..WS90_868
+                    })
+                    .await,
                 Err(Error::Spi(spi::ErrorKind::Other))
             );
         });

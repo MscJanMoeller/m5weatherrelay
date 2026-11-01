@@ -46,8 +46,14 @@ It is **not implemented**: SX1276 supports different bandwidth steps (including
 125 kHz rather than SX1262's 117.3 kHz), so it requires a suitable profile.
 The current SX1262 driver supports the chip's 150-960 MHz range, the GFSK
 receive bandwidths of the `sx1262` driver (the WS90 profile uses 117.3 kHz), a 3 V
-TCXO, a 1-8 byte sync word, fixed-length packets and disabled radio CRC and
-whitening. The preamble detector length follows from the profile: the longest of
+TCXO, a 1-8 byte sync word and fixed-length packets. The profile's optional
+`crc` (1 or 2 bytes, initial value, polynomial, inversion; `CrcConfig::CCITT`
+is the RadioLib default) and `whitening` (9-bit seed; `WhiteningConfig::DEFAULT`
+is RadioLib's 0x01FF) are off when `None`, as in the WS90 profile. The CRC and
+whitening settings are covered by host tests only: they are not validated on
+hardware, and it is unchecked whether the radio counts the CRC bytes in the
+received payload length that `read_packet` compares with the profile's
+`packet_length`. The preamble detector length follows from the profile: the longest of
 8, 16, 24 or 32 bits that fits the shorter of the sync word and the preamble.
 Unsupported settings are rejected. The image calibration uses the
 datasheet value of the ISM band containing the frequency (430-440, 470-510,

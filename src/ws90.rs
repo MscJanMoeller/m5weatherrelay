@@ -8,8 +8,8 @@ pub const WS90_868: FskProfile<'static> = FskProfile {
     preamble_bits: 48,
     sync_word: &[0x2d, 0xd4],
     packet_length: 64,
-    crc_enabled: false,
-    whitening_enabled: false,
+    crc: None,
+    whitening: None,
 };
 
 #[cfg(test)]
@@ -25,9 +25,6 @@ mod tests {
         assert_eq!(WS90_868.preamble_bits, 48);
         assert_eq!(WS90_868.sync_word, &[0x2d, 0xd4]);
         assert_eq!(WS90_868.packet_length, 64);
-        assert_eq!(
-            (WS90_868.crc_enabled, WS90_868.whitening_enabled),
-            (false, false)
-        );
+        assert_eq!((WS90_868.crc, WS90_868.whitening), (None, None));
     }
 }
