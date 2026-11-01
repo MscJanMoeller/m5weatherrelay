@@ -85,13 +85,10 @@ async fn main(_spawner: Spawner) {
     set_radio_front_end(&mut i2c, true, false).expect("Radio reset release failed");
     Timer::after(Duration::from_millis(10)).await;
     let mut radio = Sx1262::new(radio_spi, radio_busy, radio_irq, Delay);
-    let init_status = radio
+    radio
         .init_fsk(&WS90_868)
         .await
         .expect("SX1262 initialization failed");
-    if init_status.cleared_xosc_start_error {
-        esp_println::println!("SX1262: cleared oscillator error before enabling TCXO");
-    }
     set_radio_front_end(&mut i2c, true, true).expect("Radio front-end enable failed");
     radio
         .start_receive()

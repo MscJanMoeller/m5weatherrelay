@@ -87,11 +87,6 @@ impl<S, B, I> From<sx1262::Error<S>> for Error<S, B, I> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct InitStatus {
-    pub cleared_xosc_start_error: bool,
-}
-
 /// Receive-only SX1262 radio for fixed-length GFSK packets.
 ///
 /// Call [`Self::init_fsk`] and then [`Self::start_receive`] before reading
@@ -138,7 +133,7 @@ where
     pub async fn init_fsk(
         &mut self,
         profile: &FskProfile<'_>,
-    ) -> Result<InitStatus, Error<SPI::Error, BUSY::Error, IRQ::Error>> {
+    ) -> Result<(), Error<SPI::Error, BUSY::Error, IRQ::Error>> {
         let bandwidth =
             GfskBandwidth::from_hz(profile.rx_bandwidth_hz).ok_or(Error::InvalidProfile)?;
         if !RfFrequencyConfig::FREQUENCY_HZ.contains(&profile.frequency_hz)
@@ -162,8 +157,8 @@ where
         if startup_errors & !DeviceErrors::XOSC_START_ERROR != 0 {
             return Err(Error::DeviceErrors(startup_errors));
         }
-        let cleared_xosc_start_error = startup_errors & DeviceErrors::XOSC_START_ERROR != 0;
-        if cleared_xosc_start_error {
+        if startup_errors & DeviceErrors::XOSC_START_ERROR != 0 {
+            // Expected at power-on with a TCXO, which the chip only knows after the next command.
             self.execute_command(ClearDeviceErrors).await?;
         }
         self.execute_command(SetDio3AsTcxoCtrl {
@@ -246,9 +241,7 @@ where
         })
         .await?;
         self.packet_length = Some(profile.packet_length);
-        Ok(InitStatus {
-            cleared_xosc_start_error,
-        })
+        Ok(())
     }
 
     /// Enters continuous receive mode, in which the radio keeps receiving
@@ -985,12 +978,7 @@ mod tests {
         block_on(async {
             let mut radio = radio();
             radio.device.spi_mut().device_errors = 0x20;
-            assert_eq!(
-                radio.init_fsk(&WS90_868).await,
-                Ok(InitStatus {
-                    cleared_xosc_start_error: true
-                })
-            );
+            assert_eq!(radio.init_fsk(&WS90_868).await, Ok(()));
             assert_eq!(radio.device.spi().commands[2], [0x07, 0, 0]);
 
             radio.device.spi_mut().device_errors = 0x21;
