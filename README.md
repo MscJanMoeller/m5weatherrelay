@@ -18,8 +18,9 @@ dependency is not pinned by `Cargo.lock` and is not portable by itself.
 
 Connect the Unit C6L over USB. The OLED displays `M5`, `Weather` and `Relay`.
 The SX1262 listens at 868.350 MHz using 17.2 kbps FSK, 35 kHz deviation,
-117.3 kHz bandwidth, sync `2D D4` and fixed 64-byte packets. Every 10 seconds
-the monitor reports packet count, IRQ flags and DIO1; received packets are
+117.3 kHz bandwidth, sync `2D D4` and fixed 64-byte packets. The firmware sleeps
+until the radio raises DIO1 and then reads the packet. Every 10 seconds
+the monitor reports packet count and the DIO1 level; received packets are
 printed in hex with RSSI. Raw packets have been received on hardware but are
 not yet validated or decoded; their source has not been confirmed.
 Buzzer and RGB data pins are held low.
@@ -29,9 +30,9 @@ GPIO waits and delays, and follows RadioLib concepts (`init_fsk`,
 `start_receive`, `read_packet`). `start_receive` enters continuous receive
 mode, so the radio keeps receiving after each packet, as with RadioLib's
 `startReceive` and `readData`. Its `receive` method awaits the IRQ pin and
-reads one packet. For its own reaction to IRQ flags the firmware uses the
-lower-level `wait_for_irq_pin`, `read_irq_flags`, `read_packet` and
-`clear_irq_flags`, which also retains diagnostics. `read_packet` clears the
+reads one packet. The firmware uses the lower-level `wait_for_irq_pin`,
+`read_irq_flags`, `read_packet` and `clear_irq_flags` instead, because only the
+pin wait can safely race its heartbeat timer. `read_packet` clears the
 packet flags first and reports `PacketOverrun` if the next packet starts
 arriving while the buffer is read; error flags are left for the caller to
 clear. Use `standby` and `start_receive` to stop and restart receiving. Do not

@@ -6,7 +6,7 @@ use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
-use embassy_time::{Delay, Duration, Instant, Timer};
+use embassy_time::{Delay, Duration, Ticker, Timer};
 use esp_backtrace as _;
 use esp_hal::{
     gpio::{Input, InputConfig, Level, Output, OutputConfig},
@@ -98,19 +98,20 @@ async fn main(_spawner: Spawner) {
 
     let mut packets = 0u32;
     let mut buffer = [0; 64];
-    let mut next_poll = Instant::now() + Duration::from_secs(1);
-    let mut next_heartbeat = Instant::now() + Duration::from_secs(10);
+    let mut heartbeat = Ticker::every(Duration::from_secs(10));
     loop {
-        let irq_woke = match select(radio.wait_for_irq_pin(), Timer::at(next_poll)).await {
-            Either::First(result) => {
-                result.expect("SX1262 IRQ pin wait failed");
-                true
-            }
+        // The radio keeps DIO1 high until the IRQ flags are cleared, so no pin change is missed.
+        match select(radio.wait_for_irq_pin(), heartbeat.next()).await {
+            Either::First(result) => result.expect("SX1262 IRQ pin wait failed"),
             Either::Second(()) => {
-                next_poll = Instant::now() + Duration::from_secs(1);
-                false
+                esp_println::println!(
+                    "SX1262: listening; {} packets, DIO1 {}",
+                    packets,
+                    radio.irq_pin_is_high().expect("SX1262 IRQ pin read failed")
+                );
+                continue;
             }
-        };
+        }
         let flags = radio
             .read_irq_flags()
             .await
@@ -146,19 +147,10 @@ async fn main(_spawner: Spawner) {
                 }
                 Err(error) => panic!("SX1262 packet read failed: {:?}", error),
             }
-        } else if irq_woke {
+        } else {
             panic!(
                 "SX1262: IRQ pin asserted without receive IRQ: 0x{:04x}",
                 flags
-            );
-        }
-        if Instant::now() >= next_heartbeat {
-            next_heartbeat = Instant::now() + Duration::from_secs(10);
-            esp_println::println!(
-                "SX1262: listening; {} packets, IRQ 0x{:04x}, DIO1 {}",
-                packets,
-                flags,
-                radio.irq_pin_is_high().expect("SX1262 IRQ pin read failed")
             );
         }
     }
