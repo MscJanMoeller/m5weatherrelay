@@ -6,6 +6,7 @@ use embassy_futures::select::{Either, select};
 use embedded_hal::digital::InputPin;
 use embedded_hal_async::{delay::DelayNs, digital::Wait, spi::SpiDevice};
 use regiface::{Command, ReadableRegister, WritableRegister};
+pub use sx1262::commands::{RegulatorMode, TcxoVoltage};
 use sx1262::{
     Device,
     commands::{
@@ -14,10 +15,9 @@ use sx1262::{
         GFSKPacketHeaderType, GFSKPacketParams, GetDeviceErrors, GetIrqStatus, GetPacketStatus,
         GetRawStatus, GetRxBufferStatus, GfskBandwidth, GfskModParams, GfskPulseShape,
         ImageCalibConfig, IrqMask, ModulationParams, PacketParams, PacketType,
-        PreambleDetectorLength, RegulatorMode, RfFrequencyConfig, RxMode, SetBufferBaseAddress,
-        SetDio3AsTcxoCtrl, SetDioIrqParams, SetModulationParams, SetPacketParams, SetPacketType,
-        SetRegulatorMode, SetRfFrequency, SetRx, SetStandby, StandbyConfig, TcxoConfig,
-        TcxoVoltage,
+        PreambleDetectorLength, RfFrequencyConfig, RxMode, SetBufferBaseAddress, SetDio3AsTcxoCtrl,
+        SetDioIrqParams, SetModulationParams, SetPacketParams, SetPacketType, SetRegulatorMode,
+        SetRfFrequency, SetRx, SetStandby, StandbyConfig, TcxoConfig,
     },
     device::{OPCODE_READ_BUFFER, OPCODE_READ_REGISTER, OPCODE_WRITE_REGISTER},
     registers::{CrcInitialValue, CrcPolynomial, SyncWord, WhiteningInitialValue},
@@ -45,7 +45,32 @@ const BUSY_TIMEOUT_US: u32 = 250_000;
 const SYNC_WORD_BYTES: RangeInclusive<usize> = 1..=8;
 // BUSY rises up to 600 ns (datasheet TSW) after NSS rises at the end of a write command.
 const BUSY_RISE_DELAY_US: u32 = 1;
+/// Time the chip waits for a TCXO to settle: 320 steps of 15.625 µs, which is 5 ms.
 const TCXO_STARTUP_DELAY_STEPS: u32 = 320;
+
+/// How the board supplies the radio's clock and core voltage. These depend on the PCB,
+/// not on the radio link, so they belong to the receiver and not to the `FskProfile`.
+#[derive(Debug, Clone, Copy)]
+pub struct BoardConfig {
+    /// Voltage the radio supplies to a TCXO through DIO3, or `None` for a plain crystal.
+    pub tcxo: Option<TcxoVoltage>,
+    /// Regulator the radio uses. DC-DC needs an external inductor.
+    pub regulator: RegulatorMode,
+}
+
+impl BoardConfig {
+    /// RadioLib's defaults: a 1.6 V TCXO and the DC-DC regulator.
+    pub const DEFAULT: Self = Self {
+        tcxo: Some(TcxoVoltage::V1_6),
+        regulator: RegulatorMode::DcDcLdo,
+    };
+}
+
+impl Default for BoardConfig {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error<S, B, I> {
@@ -114,6 +139,8 @@ pub struct Sx1262<SPI, BUSY, IRQ, DELAY> {
     /// Whether the radio is in receive mode: set by [`Self::start_receive`]
     /// and cleared by [`Self::standby`] and [`Self::init_fsk`].
     receiving: bool,
+    /// Oscillator and regulator setup that [`Self::init_fsk`] applies.
+    board: BoardConfig,
 }
 
 impl<SPI, BUSY, IRQ, DELAY> Sx1262<SPI, BUSY, IRQ, DELAY>
@@ -123,6 +150,8 @@ where
     IRQ: Wait + InputPin,
     DELAY: DelayNs,
 {
+    /// Creates a receiver for a board with [`BoardConfig::DEFAULT`]; call
+    /// [`Self::with_board`] for any other board.
     pub fn new(spi: SPI, busy: BUSY, irq: IRQ, delay: DELAY) -> Self {
         Self {
             device: Device::new(spi),
@@ -131,7 +160,14 @@ where
             delay,
             packet_length: None,
             receiving: false,
+            board: BoardConfig::DEFAULT,
         }
+    }
+
+    /// Sets the board's oscillator and regulator, which [`Self::init_fsk`] applies.
+    pub fn with_board(mut self, board: BoardConfig) -> Self {
+        self.board = board;
+        self
     }
 
     pub async fn init_fsk(
@@ -163,22 +199,30 @@ where
         })
         .await?;
         let startup_errors = self.execute_command(GetDeviceErrors).await?.errors.raw;
-        if startup_errors & !DeviceErrors::XOSC_START_ERROR != 0 {
+        // At power-on a TCXO board reports an oscillator start error, because the chip only
+        // learns about the TCXO from the next command. With a crystal it is a real fault.
+        let expected_errors = if self.board.tcxo.is_some() {
+            DeviceErrors::XOSC_START_ERROR
+        } else {
+            0
+        };
+        if startup_errors & !expected_errors != 0 {
             return Err(Error::DeviceErrors(startup_errors));
         }
-        if startup_errors & DeviceErrors::XOSC_START_ERROR != 0 {
-            // Expected at power-on with a TCXO, which the chip only knows after the next command.
+        if startup_errors != 0 {
             self.execute_command(ClearDeviceErrors).await?;
         }
-        self.execute_command(SetDio3AsTcxoCtrl {
-            config: TcxoConfig {
-                voltage: TcxoVoltage::V3_0,
-                delay: TCXO_STARTUP_DELAY_STEPS,
-            },
-        })
-        .await?;
+        if let Some(voltage) = self.board.tcxo {
+            self.execute_command(SetDio3AsTcxoCtrl {
+                config: TcxoConfig {
+                    voltage,
+                    delay: TCXO_STARTUP_DELAY_STEPS,
+                },
+            })
+            .await?;
+        }
         self.execute_command(SetRegulatorMode {
-            mode: RegulatorMode::LdoOnly,
+            mode: self.board.regulator,
         })
         .await?;
         self.execute_command(Calibrate {
@@ -206,6 +250,7 @@ where
         self.execute_command(SetModulationParams {
             params: ModulationParams::Gfsk(GfskModParams {
                 bit_rate: profile.bit_rate,
+                // Shapes transmitted data only (datasheet table 13-44), so a receiver leaves it off.
                 pulse_shape: GfskPulseShape::NoFilter,
                 bandwidth,
                 freq_deviation: profile.frequency_deviation_hz,
@@ -803,6 +848,12 @@ mod tests {
         }
     }
 
+    /// The Unit C6L's board: 3 V TCXO and the LDO regulator.
+    const TEST_BOARD: BoardConfig = BoardConfig {
+        tcxo: Some(TcxoVoltage::V3_0),
+        regulator: RegulatorMode::LdoOnly,
+    };
+
     fn radio() -> Sx1262<MockSpi, MockBusy, MockBusy, MockDelay> {
         let mut radio = Sx1262::new(
             MockSpi::default(),
@@ -812,7 +863,8 @@ mod tests {
                 fail: false,
             },
             MockDelay::default(),
-        );
+        )
+        .with_board(TEST_BOARD);
         radio.packet_length = Some(64);
         radio.receiving = true;
         radio
@@ -972,8 +1024,8 @@ mod tests {
             let mut radio = radio();
             radio
                 .init_fsk(&FskProfile {
-                    crc: Some(CrcConfig::CCITT),
-                    whitening: Some(WhiteningConfig::DEFAULT),
+                    crc: Some(CrcConfig::default()),
+                    whitening: Some(WhiteningConfig::default()),
                     ..WS90_868
                 })
                 .await
@@ -1159,6 +1211,45 @@ mod tests {
             assert_eq!(
                 radio.init_fsk(&WS90_868).await,
                 Err(Error::DeviceErrors(0x21))
+            );
+        });
+    }
+
+    #[test]
+    fn board_defaults_follow_radiolib() {
+        block_on(async {
+            let mut radio = Sx1262::new(
+                MockSpi::default(),
+                MockBusy::default(),
+                MockBusy {
+                    high: true,
+                    fail: false,
+                },
+                MockDelay::default(),
+            );
+            radio.init_fsk(&WS90_868).await.unwrap();
+            let commands = &radio.device.spi().commands;
+            assert_eq!(commands[2], [0x97, 0x00, 0, 1, 0x40]);
+            assert_eq!(commands[3], [0x96, 1]);
+        });
+    }
+
+    #[test]
+    fn crystal_board_skips_tcxo_and_reports_oscillator_errors() {
+        block_on(async {
+            let mut radio = radio().with_board(BoardConfig {
+                tcxo: None,
+                regulator: RegulatorMode::DcDcLdo,
+            });
+            radio.init_fsk(&WS90_868).await.unwrap();
+            let commands = &radio.device.spi().commands;
+            assert!(commands.iter().all(|command| command[0] != 0x97));
+            assert_eq!(commands[2], [0x96, 1]);
+
+            radio.device.spi_mut().device_errors = 0x20;
+            assert_eq!(
+                radio.init_fsk(&WS90_868).await,
+                Err(Error::DeviceErrors(0x20))
             );
         });
     }

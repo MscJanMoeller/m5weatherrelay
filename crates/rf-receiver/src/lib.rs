@@ -58,6 +58,12 @@ impl CrcConfig {
     };
 }
 
+impl Default for CrcConfig {
+    fn default() -> Self {
+        Self::CCITT
+    }
+}
+
 /// Data whitening settings. They must match the transmitter's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WhiteningConfig {
@@ -69,6 +75,12 @@ impl WhiteningConfig {
     /// Seed 0x01FF, as RadioLib uses for compatibility with SX127x radios. The
     /// SX1262's own reset value is 0x0100.
     pub const DEFAULT: Self = Self { initial: 0x01ff };
+}
+
+impl Default for WhiteningConfig {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
 }
 
 /// Metadata for the packet copied into the caller's buffer.

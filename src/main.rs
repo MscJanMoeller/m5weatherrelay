@@ -17,7 +17,7 @@ use esp_hal::{
 };
 use m5weatherrelay::{
     display::{DISPLAY_ROTATION, write_text},
-    hardware::{init_io_expander, set_radio_front_end},
+    hardware::{RADIO_BOARD, init_io_expander, set_radio_front_end},
     ws90::WS90_868,
 };
 use rf_receiver::{
@@ -84,7 +84,7 @@ async fn main(_spawner: Spawner) {
     Timer::after(Duration::from_millis(100)).await;
     set_radio_front_end(&mut i2c, true, false).expect("Radio reset release failed");
     Timer::after(Duration::from_millis(10)).await;
-    let mut radio = Sx1262::new(radio_spi, radio_busy, radio_irq, Delay);
+    let mut radio = Sx1262::new(radio_spi, radio_busy, radio_irq, Delay).with_board(RADIO_BOARD);
     radio
         .init_fsk(&WS90_868)
         .await

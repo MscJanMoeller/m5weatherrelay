@@ -1,7 +1,14 @@
 use embedded_hal::i2c::I2c;
+use rf_receiver::sx1262::{BoardConfig, RegulatorMode, TcxoVoltage};
 
 const IO_EXPANDER_ADDRESS: u8 = 0x43;
 const IO_EXPANDER_ID: u8 = 0x01;
+
+/// The Unit C6L's radio is clocked by a 3 V TCXO and has no DC-DC inductor.
+pub const RADIO_BOARD: BoardConfig = BoardConfig {
+    tcxo: Some(TcxoVoltage::V3_0),
+    regulator: RegulatorMode::LdoOnly,
+};
 
 // M5Unified's Unit C6L defaults: radio out of reset, RF switch and LNA off.
 const IO_EXPANDER_CONFIG: [(u8, u8); 7] = [
@@ -189,5 +196,16 @@ mod tests {
             set_radio_front_end(&mut i2c, true, true),
             Err(ErrorKind::Other)
         );
+    }
+
+    #[test]
+    fn radio_board_has_the_unit_c6l_tcxo_and_regulator() {
+        assert!(matches!(
+            RADIO_BOARD,
+            BoardConfig {
+                tcxo: Some(TcxoVoltage::V3_0),
+                regulator: RegulatorMode::LdoOnly,
+            }
+        ));
     }
 }
