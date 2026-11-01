@@ -54,7 +54,19 @@ pub enum Error<S, B, I> {
     UnexpectedIrq(u16),
 }
 
-/// Outcome after handling the IRQ flags returned by [`Sx1262::get_irq_flags`].
+impl<S, B, I> From<sx1262::Error<S>> for Error<S, B, I> {
+    fn from(error: sx1262::Error<S>) -> Self {
+        match error {
+            sx1262::Error::Spi(error) => Self::Spi(error),
+            sx1262::Error::Serialization => Self::DriverSerializationError,
+            sx1262::Error::Deserialization { opcode, first_byte } => {
+                Self::DriverDeserializationError { opcode, first_byte }
+            }
+        }
+    }
+}
+
+/// Outcome after handling the IRQ flags returned by [`Sx1262::read_irq_flags`].
 pub enum ReceiveEvent {
     Pending,
     Packet(PacketInfo),
@@ -94,74 +106,7 @@ where
         }
     }
 
-    async fn wait_ready(&mut self) -> Result<(), Error<SPI::Error, BUSY::Error, IRQ::Error>> {
-        match select(
-            self.busy.wait_for_low(),
-            self.delay.delay_us(BUSY_TIMEOUT_US),
-        )
-        .await
-        {
-            Either::First(result) => result.map_err(Error::BusyPin),
-            Either::Second(()) => Err(Error::BusyTimeout),
-        }
-    }
-
-    async fn check_status(
-        &mut self,
-        opcode: u8,
-    ) -> Result<(), Error<SPI::Error, BUSY::Error, IRQ::Error>> {
-        self.delay.delay_us(1).await;
-        self.wait_ready().await?;
-        let status = self
-            .device
-            .execute_command_async(GetRawStatus)
-            .await
-            .map_err(Self::driver_error)?;
-        self.delay.delay_us(1).await;
-        if status == 0 || status == 0xff {
-            return Err(Error::InvalidStatus(status));
-        }
-        if matches!(
-            CommandStatus::from_status_byte(status),
-            Ok(CommandStatus::Timeout
-                | CommandStatus::ProcessingError
-                | CommandStatus::ExecutionFailure)
-        ) {
-            return Err(Error::CommandFailed { opcode, status });
-        }
-        Ok(())
-    }
-
-    async fn driver_command<C>(
-        &mut self,
-        command: C,
-    ) -> Result<C::ResponseParameters, Error<SPI::Error, BUSY::Error, IRQ::Error>>
-    where
-        C: Command<IdType = u8>,
-    {
-        self.wait_ready().await?;
-        let response = self
-            .device
-            .execute_command_async(command)
-            .await
-            .map_err(Self::driver_error)?;
-        self.check_status(C::id()).await?;
-        Ok(response)
-    }
-
-    fn driver_error(
-        error: sx1262::Error<SPI::Error>,
-    ) -> Error<SPI::Error, BUSY::Error, IRQ::Error> {
-        match error {
-            sx1262::Error::Spi(error) => Error::Spi(error),
-            sx1262::Error::Serialization => Error::DriverSerializationError,
-            sx1262::Error::Deserialization { opcode, first_byte } => {
-                Error::DriverDeserializationError { opcode, first_byte }
-            }
-        }
-    }
-
-    pub async fn begin_fsk(
+    pub async fn init_fsk(
         &mut self,
         profile: &FskProfile<'_>,
     ) -> Result<InitStatus, Error<SPI::Error, BUSY::Error, IRQ::Error>> {
@@ -181,52 +126,52 @@ where
         }
         self.packet_length = None;
         self.receiving = false;
-        self.driver_command(SetStandby {
+        self.execute_command(SetStandby {
             config: StandbyConfig::Rc,
         })
         .await?;
-        let startup_errors = self.driver_command(GetDeviceErrors).await?.errors.raw;
+        let startup_errors = self.execute_command(GetDeviceErrors).await?.errors.raw;
         if startup_errors & !DeviceErrors::XOSC_START_ERROR != 0 {
             return Err(Error::DeviceErrors(startup_errors));
         }
         let cleared_xosc_start_error = startup_errors & DeviceErrors::XOSC_START_ERROR != 0;
         if cleared_xosc_start_error {
-            self.driver_command(ClearDeviceErrors).await?;
+            self.execute_command(ClearDeviceErrors).await?;
         }
-        self.driver_command(SetDio3AsTcxoCtrl {
+        self.execute_command(SetDio3AsTcxoCtrl {
             config: TcxoConfig {
                 voltage: TcxoVoltage::V3_0,
                 delay: TCXO_STARTUP_DELAY_STEPS,
             },
         })
         .await?;
-        self.driver_command(SetRegulatorMode {
+        self.execute_command(SetRegulatorMode {
             mode: RegulatorMode::LdoOnly,
         })
         .await?;
-        self.driver_command(Calibrate {
+        self.execute_command(Calibrate {
             config: CalibrationConfig::all(),
         })
         .await?;
-        self.driver_command(CalibrateImage {
+        self.execute_command(CalibrateImage {
             config: ImageCalibConfig::BAND_863_870_MHZ,
         })
         .await?;
-        let errors = self.driver_command(GetDeviceErrors).await?.errors.raw;
+        let errors = self.execute_command(GetDeviceErrors).await?.errors.raw;
         if errors != 0 {
             return Err(Error::DeviceErrors(errors));
         }
-        self.driver_command(SetPacketType {
+        self.execute_command(SetPacketType {
             packet_type: PacketType::Gfsk,
         })
         .await?;
-        self.driver_command(SetRfFrequency {
+        self.execute_command(SetRfFrequency {
             config: RfFrequencyConfig {
                 frequency: profile.frequency_hz,
             },
         })
         .await?;
-        self.driver_command(SetModulationParams {
+        self.execute_command(SetModulationParams {
             params: ModulationParams::Gfsk(GfskModParams {
                 bit_rate: profile.bit_rate,
                 pulse_shape: GfskPulseShape::NoFilter,
@@ -237,13 +182,12 @@ where
         .await?;
         let mut sync_word = [0; 8];
         sync_word[..profile.sync_word.len()].copy_from_slice(profile.sync_word);
-        self.wait_ready().await?;
+        self.wait_while_busy().await?;
         self.device
             .write_register_async(SyncWord { value: sync_word })
-            .await
-            .map_err(Self::driver_error)?;
-        self.check_status(OPCODE_WRITE_REGISTER).await?;
-        self.driver_command(SetPacketParams {
+            .await?;
+        self.check_command_status(OPCODE_WRITE_REGISTER).await?;
+        self.execute_command(SetPacketParams {
             params: PacketParams::GFSK(GFSKPacketParams {
                 preamble_length: profile.preamble_bits,
                 preamble_detector_length: PreambleDetectorLength::Bits16,
@@ -256,14 +200,14 @@ where
             }),
         })
         .await?;
-        self.driver_command(SetBufferBaseAddress {
+        self.execute_command(SetBufferBaseAddress {
             config: BufferBaseAddressConfig {
                 tx_base_addr: 0,
                 rx_base_addr: 0,
             },
         })
         .await?;
-        self.driver_command(SetDioIrqParams {
+        self.execute_command(SetDioIrqParams {
             config: DioIrqConfig {
                 irq_mask: IrqMask::from_bits_retain(IRQ_MASK),
                 dio1_mask: IrqMask::from_bits_retain(IRQ_DIO1_MASK),
@@ -285,11 +229,11 @@ where
             return Err(Error::NotConfigured);
         }
         self.standby().await?;
-        self.driver_command(ClearIrqStatus {
+        self.execute_command(ClearIrqStatus {
             irq_mask: IrqMask::from_bits_retain(0xffff),
         })
         .await?;
-        self.driver_command(SetRx {
+        self.execute_command(SetRx {
             mode: RxMode::Continuous,
         })
         .await?;
@@ -299,7 +243,7 @@ where
 
     pub async fn standby(&mut self) -> Result<(), Error<SPI::Error, BUSY::Error, IRQ::Error>> {
         self.receiving = false;
-        self.driver_command(SetStandby {
+        self.execute_command(SetStandby {
             config: StandbyConfig::Rc,
         })
         .await?;
@@ -314,13 +258,13 @@ where
         self.irq.is_high()
     }
 
-    pub async fn get_irq_flags(
+    pub async fn read_irq_flags(
         &mut self,
     ) -> Result<u16, Error<SPI::Error, BUSY::Error, IRQ::Error>> {
-        Ok(self.driver_command(GetIrqStatus).await?.irq_mask.bits())
+        Ok(self.execute_command(GetIrqStatus).await?.irq_mask.bits())
     }
 
-    pub async fn read_data(
+    pub async fn read_packet(
         &mut self,
         buffer: &mut [u8],
     ) -> Result<PacketInfo, Error<SPI::Error, BUSY::Error, IRQ::Error>> {
@@ -332,17 +276,16 @@ where
             });
         }
         self.standby().await?;
-        let buffer_status = self.driver_command(GetRxBufferStatus).await?.buffer_status;
+        let buffer_status = self.execute_command(GetRxBufferStatus).await?.buffer_status;
         if usize::from(buffer_status.payload_length) != length {
             return Err(Error::InvalidPacketLength(buffer_status.payload_length));
         }
-        self.wait_ready().await?;
+        self.wait_while_busy().await?;
         self.device
             .read_buffer_async(buffer_status.buffer_pointer, &mut buffer[..length])
-            .await
-            .map_err(Self::driver_error)?;
-        self.check_status(OPCODE_READ_BUFFER).await?;
-        let packet_status = self.driver_command(GetPacketStatus).await?.packet_status;
+            .await?;
+        self.check_command_status(OPCODE_READ_BUFFER).await?;
+        let packet_status = self.execute_command(GetPacketStatus).await?.packet_status;
         Ok(PacketInfo {
             len: length,
             rssi_half_dbm: packet_status.gfsk_rssi_avg_half_dbm(),
@@ -350,7 +293,7 @@ where
     }
 
     /// Handle receive IRQs and rearm before returning a packet or receive error.
-    pub async fn handle_irq(
+    pub async fn handle_irq_flags(
         &mut self,
         flags: u16,
         buffer: &mut [u8],
@@ -363,7 +306,7 @@ where
             return Ok(ReceiveEvent::Pending);
         }
 
-        let event = match self.read_data(buffer).await {
+        let event = match self.read_packet(buffer).await {
             Ok(packet) => ReceiveEvent::Packet(packet),
             Err(Error::InvalidPacketLength(length)) => ReceiveEvent::InvalidPacketLength(length),
             Err(error) => return Err(error),
@@ -391,13 +334,61 @@ where
             });
         }
         self.wait_for_irq().await?;
-        let flags = self.get_irq_flags().await?;
-        match self.handle_irq(flags, buffer).await? {
+        let flags = self.read_irq_flags().await?;
+        match self.handle_irq_flags(flags, buffer).await? {
             ReceiveEvent::Packet(packet) => Ok(packet),
             ReceiveEvent::RadioError(flags) => Err(Error::ReceiveIrq(flags)),
             ReceiveEvent::InvalidPacketLength(length) => Err(Error::InvalidPacketLength(length)),
             ReceiveEvent::Pending => Err(Error::UnexpectedIrq(flags)),
         }
+    }
+
+    async fn wait_while_busy(&mut self) -> Result<(), Error<SPI::Error, BUSY::Error, IRQ::Error>> {
+        match select(
+            self.busy.wait_for_low(),
+            self.delay.delay_us(BUSY_TIMEOUT_US),
+        )
+        .await
+        {
+            Either::First(result) => result.map_err(Error::BusyPin),
+            Either::Second(()) => Err(Error::BusyTimeout),
+        }
+    }
+
+    async fn check_command_status(
+        &mut self,
+        opcode: u8,
+    ) -> Result<(), Error<SPI::Error, BUSY::Error, IRQ::Error>> {
+        self.delay.delay_us(1).await;
+        self.wait_while_busy().await?;
+        let status = self.device.execute_command_async(GetRawStatus).await?;
+        self.delay.delay_us(1).await;
+        if status == 0 || status == 0xff {
+            return Err(Error::InvalidStatus(status));
+        }
+        if matches!(
+            CommandStatus::from_status_byte(status),
+            Ok(CommandStatus::Timeout
+                | CommandStatus::ProcessingError
+                | CommandStatus::ExecutionFailure)
+        ) {
+            return Err(Error::CommandFailed { opcode, status });
+        }
+        Ok(())
+    }
+
+    /// Runs a driver command between the BUSY handshake and a status check.
+    async fn execute_command<C>(
+        &mut self,
+        command: C,
+    ) -> Result<C::ResponseParameters, Error<SPI::Error, BUSY::Error, IRQ::Error>>
+    where
+        C: Command<IdType = u8>,
+    {
+        self.wait_while_busy().await?;
+        let response = self.device.execute_command_async(command).await?;
+        self.check_command_status(C::id()).await?;
+        Ok(response)
     }
 }
 
@@ -713,7 +704,7 @@ mod tests {
     fn configures_validated_ws90_profile() {
         block_on(async {
             let mut radio = radio();
-            radio.begin_fsk(&WS90_868).await.unwrap();
+            radio.init_fsk(&WS90_868).await.unwrap();
             assert_eq!(
                 radio.device.spi().commands,
                 vec![
@@ -741,7 +732,7 @@ mod tests {
         block_on(async {
             let mut radio = radio();
             radio
-                .begin_fsk(&FskProfile {
+                .init_fsk(&FskProfile {
                     sync_word: &[0xab, 0xcd],
                     ..WS90_868
                 })
@@ -772,7 +763,7 @@ mod tests {
             {
                 let mut radio = radio();
                 radio
-                    .begin_fsk(&FskProfile {
+                    .init_fsk(&FskProfile {
                         frequency_hz: frequency,
                         bit_rate,
                         frequency_deviation_hz: deviation,
@@ -800,7 +791,7 @@ mod tests {
         block_on(async {
             let mut radio = radio();
             radio
-                .begin_fsk(&FskProfile {
+                .init_fsk(&FskProfile {
                     rx_bandwidth_hz: 156_200,
                     ..WS90_868
                 })
@@ -858,9 +849,54 @@ mod tests {
                     ..WS90_868
                 },
             ] {
-                assert_eq!(radio.begin_fsk(&profile).await, Err(Error::InvalidProfile));
+                assert_eq!(radio.init_fsk(&profile).await, Err(Error::InvalidProfile));
                 assert!(radio.device.spi().commands.is_empty());
             }
+        });
+    }
+
+    #[test]
+    fn reports_initialization_response_details() {
+        block_on(async {
+            let mut radio = radio();
+            radio.device.spi_mut().response_status = Some(0);
+            assert_eq!(
+                radio.init_fsk(&WS90_868).await,
+                Err(Error::DriverDeserializationError {
+                    opcode: 0x17,
+                    first_byte: Some(0),
+                })
+            );
+        });
+    }
+
+    #[test]
+    fn accepts_radio_response_with_reserved_command_status() {
+        block_on(async {
+            let mut radio = radio();
+            radio.device.spi_mut().response_status = Some(0xa2);
+            assert!(radio.init_fsk(&WS90_868).await.is_ok());
+        });
+    }
+
+    #[test]
+    fn clears_only_the_expected_pre_tcxo_oscillator_error() {
+        block_on(async {
+            let mut radio = radio();
+            radio.device.spi_mut().device_errors = 0x20;
+            assert_eq!(
+                radio.init_fsk(&WS90_868).await,
+                Ok(InitStatus {
+                    cleared_xosc_start_error: true
+                })
+            );
+            assert_eq!(radio.device.spi().commands[2], [0x07, 0, 0]);
+
+            radio.device.spi_mut().device_errors = 0x21;
+            assert_eq!(
+                radio.init_fsk(&WS90_868).await,
+                Err(Error::DeviceErrors(0x21))
+            );
         });
     }
 
@@ -871,8 +907,8 @@ mod tests {
             let mut buffer = [0; 64];
             radio.device.spi_mut().irq_flags = IRQ_PREAMBLE | IRQ_SYNC | IRQ_RX_DONE;
             radio.start_receive().await.unwrap();
-            assert_eq!(radio.get_irq_flags().await.unwrap(), 0x0e);
-            let packet = radio.read_data(&mut buffer).await.unwrap();
+            assert_eq!(radio.read_irq_flags().await.unwrap(), 0x0e);
+            let packet = radio.read_packet(&mut buffer).await.unwrap();
             assert_eq!(buffer[0], 0);
             assert_eq!(buffer[63], 63);
             assert_eq!(packet.len, 64);
@@ -903,7 +939,7 @@ mod tests {
             let mut radio = radio();
             radio.device.spi_mut().response_status = Some(0);
             assert_eq!(
-                radio.get_irq_flags().await,
+                radio.read_irq_flags().await,
                 Err(Error::DriverDeserializationError {
                     opcode: 0x12,
                     first_byte: Some(0),
@@ -911,31 +947,7 @@ mod tests {
             );
             radio.device.spi_mut().response_status = None;
             radio.device.spi_mut().irq_flags = 0x8200;
-            assert_eq!(radio.get_irq_flags().await, Ok(0x8200));
-        });
-    }
-
-    #[test]
-    fn reports_initialization_response_details() {
-        block_on(async {
-            let mut radio = radio();
-            radio.device.spi_mut().response_status = Some(0);
-            assert_eq!(
-                radio.begin_fsk(&WS90_868).await,
-                Err(Error::DriverDeserializationError {
-                    opcode: 0x17,
-                    first_byte: Some(0),
-                })
-            );
-        });
-    }
-
-    #[test]
-    fn accepts_radio_response_with_reserved_command_status() {
-        block_on(async {
-            let mut radio = radio();
-            radio.device.spi_mut().response_status = Some(0xa2);
-            assert!(radio.begin_fsk(&WS90_868).await.is_ok());
+            assert_eq!(radio.read_irq_flags().await, Ok(0x8200));
         });
     }
 
@@ -951,7 +963,7 @@ mod tests {
             radio.device.spi_mut().fail_opcode = Some(0x1e);
             let mut buffer = [0; 64];
             assert_eq!(
-                radio.read_data(&mut buffer).await,
+                radio.read_packet(&mut buffer).await,
                 Err(Error::Spi(spi::ErrorKind::Other))
             );
 
@@ -962,7 +974,7 @@ mod tests {
             );
             radio.device.spi_mut().fail_opcode = Some(0x13);
             assert_eq!(
-                radio.read_data(&mut buffer).await,
+                radio.read_packet(&mut buffer).await,
                 Err(Error::Spi(spi::ErrorKind::Other))
             );
             radio.device.spi_mut().fail_opcode = Some(0xc0);
@@ -972,18 +984,18 @@ mod tests {
             );
             radio.device.spi_mut().fail_opcode = Some(0x0d);
             assert_eq!(
-                radio.begin_fsk(&WS90_868).await,
+                radio.init_fsk(&WS90_868).await,
                 Err(Error::Spi(spi::ErrorKind::Other))
             );
             radio.device.spi_mut().fail_opcode = Some(0x08);
             assert_eq!(
-                radio.begin_fsk(&WS90_868).await,
+                radio.init_fsk(&WS90_868).await,
                 Err(Error::Spi(spi::ErrorKind::Other))
             );
             assert_eq!(radio.packet_length, None);
             radio.device.spi_mut().fail_opcode = Some(0x97);
             assert_eq!(
-                radio.begin_fsk(&WS90_868).await,
+                radio.init_fsk(&WS90_868).await,
                 Err(Error::Spi(spi::ErrorKind::Other))
             );
         });
@@ -997,7 +1009,7 @@ mod tests {
                 packet_length: 5,
                 ..WS90_868
             };
-            radio.begin_fsk(&profile).await.unwrap();
+            radio.init_fsk(&profile).await.unwrap();
             assert!(
                 radio
                     .device
@@ -1008,7 +1020,7 @@ mod tests {
             );
             radio.device.spi_mut().length = 5;
             let mut buffer = [0xff; 8];
-            let packet = radio.read_data(&mut buffer).await.unwrap();
+            let packet = radio.read_packet(&mut buffer).await.unwrap();
             assert_eq!(packet.len, 5);
             assert_eq!(buffer, [0, 1, 2, 3, 4, 0xff, 0xff, 0xff]);
         });
@@ -1020,12 +1032,18 @@ mod tests {
             let mut radio = radio();
             let mut buffer = [0; 64];
             assert!(matches!(
-                radio.handle_irq(IRQ_PREAMBLE | IRQ_SYNC, &mut buffer).await,
+                radio
+                    .handle_irq_flags(IRQ_PREAMBLE | IRQ_SYNC, &mut buffer)
+                    .await,
                 Ok(ReceiveEvent::Pending)
             ));
             assert!(radio.device.spi().commands.is_empty());
 
-            let packet = match radio.handle_irq(IRQ_RX_DONE, &mut buffer).await.unwrap() {
+            let packet = match radio
+                .handle_irq_flags(IRQ_RX_DONE, &mut buffer)
+                .await
+                .unwrap()
+            {
                 ReceiveEvent::Packet(packet) => packet,
                 _ => panic!("expected packet"),
             };
@@ -1039,7 +1057,7 @@ mod tests {
             radio.device.spi_mut().commands.clear();
             radio.device.spi_mut().length = 63;
             assert!(matches!(
-                radio.handle_irq(IRQ_RX_DONE, &mut buffer).await,
+                radio.handle_irq_flags(IRQ_RX_DONE, &mut buffer).await,
                 Ok(ReceiveEvent::InvalidPacketLength(63))
             ));
             assert!(!radio.device.spi().commands.iter().any(|cmd| cmd[0] == 0x1e));
@@ -1050,7 +1068,7 @@ mod tests {
 
             radio.device.spi_mut().commands.clear();
             assert!(matches!(
-                radio.handle_irq(IRQ_RX_DONE | IRQ_CRC_ERROR, &mut buffer).await,
+                radio.handle_irq_flags(IRQ_RX_DONE | IRQ_CRC_ERROR, &mut buffer).await,
                 Ok(ReceiveEvent::RadioError(flags)) if flags == IRQ_RX_DONE | IRQ_CRC_ERROR
             ));
             assert!(!radio.device.spi().commands.iter().any(|cmd| cmd[0] == 0x13));
@@ -1061,7 +1079,7 @@ mod tests {
 
             radio.device.spi_mut().fail_opcode = Some(0x82);
             assert!(matches!(
-                radio.handle_irq(IRQ_TIMEOUT, &mut buffer).await,
+                radio.handle_irq_flags(IRQ_TIMEOUT, &mut buffer).await,
                 Err(Error::Spi(spi::ErrorKind::Other))
             ));
         });
@@ -1074,35 +1092,14 @@ mod tests {
             let mut buffer = [0; 64];
             radio.device.spi_mut().length = 63;
             assert!(matches!(
-                radio.read_data(&mut buffer).await,
+                radio.read_packet(&mut buffer).await,
                 Err(Error::InvalidPacketLength(63))
             ));
             assert!(!radio.device.spi().commands.iter().any(|cmd| cmd[0] == 0x1e));
             radio.device.spi_mut().calibration_errors = 0x10;
             assert_eq!(
-                radio.begin_fsk(&WS90_868).await,
+                radio.init_fsk(&WS90_868).await,
                 Err(Error::DeviceErrors(0x10))
-            );
-        });
-    }
-
-    #[test]
-    fn clears_only_the_expected_pre_tcxo_oscillator_error() {
-        block_on(async {
-            let mut radio = radio();
-            radio.device.spi_mut().device_errors = 0x20;
-            assert_eq!(
-                radio.begin_fsk(&WS90_868).await,
-                Ok(InitStatus {
-                    cleared_xosc_start_error: true
-                })
-            );
-            assert_eq!(radio.device.spi().commands[2], [0x07, 0, 0]);
-
-            radio.device.spi_mut().device_errors = 0x21;
-            assert_eq!(
-                radio.begin_fsk(&WS90_868).await,
-                Err(Error::DeviceErrors(0x21))
             );
         });
     }

@@ -83,7 +83,7 @@ async fn main(_spawner: Spawner) {
     Timer::after(Duration::from_millis(10)).await;
     let mut radio = Sx1262::new(radio_spi, radio_busy, radio_irq, Delay);
     let init_status = radio
-        .begin_fsk(&WS90_868)
+        .init_fsk(&WS90_868)
         .await
         .expect("SX1262 initialization failed");
     if init_status.cleared_xosc_start_error {
@@ -111,9 +111,12 @@ async fn main(_spawner: Spawner) {
                 false
             }
         };
-        let flags = radio.get_irq_flags().await.expect("SX1262 IRQ read failed");
+        let flags = radio
+            .read_irq_flags()
+            .await
+            .expect("SX1262 IRQ read failed");
         match radio
-            .handle_irq(flags, &mut buffer)
+            .handle_irq_flags(flags, &mut buffer)
             .await
             .expect("SX1262 receive handling failed")
         {

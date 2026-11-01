@@ -25,8 +25,8 @@ not yet validated or decoded; their source has not been confirmed.
 Buzzer and RGB data pins are held low.
 
 The receive-only `rf-receiver` crate uses async embedded-hal SPI,
-GPIO waits and delays, and follows RadioLib concepts (`begin_fsk`,
-`start_receive`, `read_data`). Its `receive` method awaits a packet and rearms
+GPIO waits and delays, and follows RadioLib concepts (`init_fsk`,
+`start_receive`, `read_packet`). Its `receive` method awaits a packet and rearms
 reception; the firmware uses lower-level IRQ handling to retain diagnostics.
 Do not cancel `receive` during SPI or rearming without reinitializing the radio.
 The OLED and radio share the same async SPI bus.
@@ -36,7 +36,8 @@ IRQ flags and errors are chip-specific. An SX1276 driver can use the same
 profile and receive concepts with a different constructor and implementation.
 It is **not implemented**: SX1276 supports different bandwidth steps (including
 125 kHz rather than SX1262's 117.3 kHz), so it requires a suitable profile.
-The current SX1262 driver supports 863-870 MHz, 117.3 kHz bandwidth, a 3 V
+The current SX1262 driver supports 863-870 MHz, the GFSK receive bandwidths of
+the `sx1262` driver (the WS90 profile uses 117.3 kHz), a 3 V
 TCXO, a two-byte sync word, fixed-length packets and disabled radio CRC and
 whitening. Unsupported settings are rejected.
 The receiver reuses the local [`sx1262`](../sx1262) async SPI device and FSK
