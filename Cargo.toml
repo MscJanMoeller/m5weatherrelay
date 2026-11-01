@@ -1,0 +1,40 @@
+[package]
+name = "m5weatherrelay"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+
+[workspace]
+members = ["crates/rf-receiver"]
+resolver = "3"
+
+[dependencies]
+display-interface = "0.5"
+embedded-hal = "1"
+embassy-futures = "0.1"
+rf-receiver = { path = "crates/rf-receiver" }
+ssd1306 = { version = "0.10", features = ["async"] }
+
+[target.'cfg(target_arch = "riscv32")'.dependencies]
+display-interface-spi = "0.5"
+embassy-embedded-hal = "0.4"
+embassy-executor = "0.9"
+embassy-sync = "0.7"
+embassy-time = "0.5"
+esp-backtrace = { version = "0.18", features = ["esp32c6", "panic-handler", "println"] }
+esp-bootloader-esp-idf = { version = "0.4", features = ["esp32c6"] }
+esp-hal = { version = "=1.0.0", features = ["esp32c6", "unstable"] }
+esp-rtos = { version = "0.2", features = ["esp32c6", "embassy"] }
+esp-println = { version = "0.16", features = ["esp32c6"] }
+
+[[bin]]
+name = "m5weatherrelay"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.release]
+opt-level = "s"
+debug = 2

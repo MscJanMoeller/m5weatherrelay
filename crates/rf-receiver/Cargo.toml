@@ -1,0 +1,14 @@
+[package]
+name = "rf-receiver"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+
+[dependencies]
+embedded-hal = "1"
+embedded-hal-async = "1"
+embassy-futures = "0.1"
+regiface = "0.2.5"
+sx1262 = { path = '..\..\..\sx1262' }

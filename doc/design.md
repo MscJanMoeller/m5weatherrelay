@@ -8,6 +8,8 @@ Rust-based firmware for the M5Stack Unit C6L (ESP32-C6), receiving Ecowitt weath
 - HAL: `esp-hal`.
 - Wireless: `esp-radio` for Wi-Fi and BLE; isolate and document vendor blobs.
 - Radio: SX1262 via SPI for receiving Ecowitt RF transmissions.
+- SX1262 driver: reuse a local `sx1262` feature branch; upstream fixes and pin
+  a published revision before sharing builds.
 - SPI sharing: Embassy shared-bus abstractions for safe access by SX1262 and OLED.
 - RF protocol: Pure Rust WS90 packet parsing, validation, checksum handling and measurement decoding.
 - Packet parsing: Dedicated bit-level parsing for Ecowitt RF packets.
@@ -22,7 +24,7 @@ Rust-based firmware for the M5Stack Unit C6L (ESP32-C6), receiving Ecowitt weath
 ### Software design
 
 Keep the firmware modular:
-- "radio" — SX1262 driver and receive handling.
+- "radio" — standalone async `no_std` receiver crate; chip-specific drivers.
 - "ecowitt" — WS90 packet parsing, validation and measurement decoding.
 - "sensors" — measurement state and sensor abstractions.
 - "network" — Wi-Fi, TCP and mDNS.
