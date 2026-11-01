@@ -15,8 +15,10 @@ pub struct FskProfile<'a> {
     pub frequency_deviation_hz: u32,
     /// Requested receiver bandwidth in hertz.
     pub rx_bandwidth_hz: u32,
-    /// Preamble length in bits.
+    /// Preamble length in bits. A receiver uses it, with the sync word length, to choose
+    /// how many preamble bits it requires before looking for the sync word.
     pub preamble_bits: u16,
+    /// Sync word bytes in transmission order.
     pub sync_word: &'a [u8],
     /// Fixed payload length in bytes.
     pub packet_length: u8,

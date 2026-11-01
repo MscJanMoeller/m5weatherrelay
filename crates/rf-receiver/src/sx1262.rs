@@ -1,6 +1,7 @@
 //! SX1262-specific control and diagnostics.
 
 use crate::{FskProfile, PacketInfo};
+use core::ops::RangeInclusive;
 use embassy_futures::select::{Either, select};
 use embedded_hal::digital::InputPin;
 use embedded_hal_async::{delay::DelayNs, digital::Wait, spi::SpiDevice};
@@ -39,6 +40,9 @@ const IRQ_NEW_PACKET: u16 = IRQ_SYNC | IRQ_RX_DONE;
 const IRQ_MASK: u16 = IRQ_RX_DONE | IRQ_PREAMBLE | IRQ_SYNC | IRQ_ERRORS;
 const IRQ_DIO1_MASK: u16 = IRQ_RX_DONE | IRQ_ERRORS;
 const BUSY_TIMEOUT_US: u32 = 250_000;
+/// The sync word register holds up to 8 bytes (datasheet table 13-55). Receiving needs at
+/// least one, because the sync word IRQ marks the start of a packet.
+const SYNC_WORD_BYTES: RangeInclusive<usize> = 1..=8;
 // BUSY rises up to 600 ns (datasheet TSW) after NSS rises at the end of a write command.
 const BUSY_RISE_DELAY_US: u32 = 1;
 const TCXO_STARTUP_DELAY_STEPS: u32 = 320;
@@ -136,17 +140,21 @@ where
     ) -> Result<(), Error<SPI::Error, BUSY::Error, IRQ::Error>> {
         let bandwidth =
             GfskBandwidth::from_hz(profile.rx_bandwidth_hz).ok_or(Error::InvalidProfile)?;
+        let sync_word_bytes = profile.sync_word.len();
         if !RfFrequencyConfig::FREQUENCY_HZ.contains(&profile.frequency_hz)
             || !GfskModParams::BIT_RATE_BPS.contains(&profile.bit_rate)
             || !GfskModParams::FREQ_DEVIATION_HZ.contains(&profile.frequency_deviation_hz)
-            || profile.preamble_bits < 16
-            || profile.sync_word.len() != 2
+            || profile.preamble_bits == 0
+            || !SYNC_WORD_BYTES.contains(&sync_word_bytes)
             || profile.packet_length == 0
             || profile.crc_enabled
             || profile.whitening_enabled
         {
             return Err(Error::InvalidProfile);
         }
+        let sync_word_bits = (sync_word_bytes * 8) as u16;
+        let preamble_detector_length =
+            PreambleDetectorLength::longest_within(sync_word_bits.min(profile.preamble_bits));
         self.packet_length = None;
         self.receiving = false;
         self.execute_command(SetStandby {
@@ -214,8 +222,8 @@ where
         self.execute_command(SetPacketParams {
             params: PacketParams::GFSK(GFSKPacketParams {
                 preamble_length: profile.preamble_bits,
-                preamble_detector_length: PreambleDetectorLength::Bits16,
-                sync_word_length: 16,
+                preamble_detector_length,
+                sync_word_length: sync_word_bits as u8,
                 address_filtering: AddressFiltering::Disable,
                 packet_type: GFSKPacketHeaderType::Fixed,
                 payload_length: profile.packet_length,
@@ -787,30 +795,46 @@ mod tests {
     }
 
     #[test]
-    fn writes_configured_sync_word_to_driver_register() {
+    fn derives_sync_word_and_preamble_detector_from_the_profile() {
         block_on(async {
-            let mut radio = radio();
-            radio
-                .init_fsk(&FskProfile {
-                    sync_word: &[0xab, 0xcd],
-                    ..WS90_868
-                })
-                .await
-                .unwrap();
-            assert!(
+            let cases: [(u16, &[u8], [u8; 4]); 7] = [
+                (48, &[0xab, 0xcd], [0, 48, 0x05, 16]),
+                (48, &[1, 2, 3, 4], [0, 48, 0x07, 32]),
+                (48, &[1, 2, 3, 4, 5, 6, 7, 8], [0, 48, 0x07, 64]),
+                (24, &[1, 2, 3, 4, 5], [0, 24, 0x06, 40]),
+                (12, &[0x55], [0, 12, 0x04, 8]),
+                (1, &[0x2d, 0xd4], [0, 1, 0x00, 16]),
+                (0x1234, &[0x2d, 0xd4], [0x12, 0x34, 0x05, 16]),
+            ];
+            for (preamble_bits, sync_word, expected) in cases {
+                let mut radio = radio();
                 radio
-                    .device
-                    .spi()
-                    .commands
-                    .contains(&vec![0x0d, 0x06, 0xc0, 0xab, 0xcd, 0, 0, 0, 0, 0, 0])
-            );
-            assert!(
-                radio
-                    .device
-                    .spi()
-                    .commands
-                    .contains(&vec![0x8c, 0, 48, 5, 16, 0, 0, 64, 1, 0])
-            );
+                    .init_fsk(&FskProfile {
+                        preamble_bits,
+                        sync_word,
+                        ..WS90_868
+                    })
+                    .await
+                    .unwrap();
+                let mut register = vec![0x0d, 0x06, 0xc0];
+                register.extend_from_slice(sync_word);
+                register.resize(11, 0);
+                let packet_params = vec![
+                    0x8c,
+                    expected[0],
+                    expected[1],
+                    expected[2],
+                    expected[3],
+                    0,
+                    0,
+                    64,
+                    1,
+                    0,
+                ];
+                let commands = &radio.device.spi().commands;
+                assert!(commands.contains(&register), "{sync_word:02x?}");
+                assert!(commands.contains(&packet_params), "{sync_word:02x?}");
+            }
         });
     }
 
@@ -919,7 +943,7 @@ mod tests {
                     ..WS90_868
                 },
                 FskProfile {
-                    preamble_bits: 15,
+                    preamble_bits: 0,
                     ..WS90_868
                 },
                 FskProfile {
@@ -927,7 +951,11 @@ mod tests {
                     ..WS90_868
                 },
                 FskProfile {
-                    sync_word: &[0x2d],
+                    sync_word: &[],
+                    ..WS90_868
+                },
+                FskProfile {
+                    sync_word: &[0; 9],
                     ..WS90_868
                 },
                 FskProfile {

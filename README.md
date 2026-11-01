@@ -46,8 +46,10 @@ It is **not implemented**: SX1276 supports different bandwidth steps (including
 125 kHz rather than SX1262's 117.3 kHz), so it requires a suitable profile.
 The current SX1262 driver supports the chip's 150-960 MHz range, the GFSK
 receive bandwidths of the `sx1262` driver (the WS90 profile uses 117.3 kHz), a 3 V
-TCXO, a two-byte sync word, fixed-length packets and disabled radio CRC and
-whitening. Unsupported settings are rejected. The image calibration uses the
+TCXO, a 1-8 byte sync word, fixed-length packets and disabled radio CRC and
+whitening. The preamble detector length follows from the profile: the longest of
+8, 16, 24 or 32 bits that fits the shorter of the sync word and the preamble.
+Unsupported settings are rejected. The image calibration uses the
 datasheet value of the ISM band containing the frequency (430-440, 470-510,
 779-787, 863-870 or 902-928 MHz); elsewhere it calibrates 4 MHz around the
 frequency as RadioLib does, which Semtech does not specify. Only 868.350 MHz
