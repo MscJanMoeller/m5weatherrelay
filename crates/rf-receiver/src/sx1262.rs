@@ -182,11 +182,12 @@ where
         .await?;
         let mut sync_word = [0; 8];
         sync_word[..profile.sync_word.len()].copy_from_slice(profile.sync_word);
-        self.wait_while_busy().await?;
-        self.device
-            .write_register_async(SyncWord { value: sync_word })
-            .await?;
-        self.check_command_status(OPCODE_WRITE_REGISTER).await?;
+        self.run_checked(OPCODE_WRITE_REGISTER, async |device| {
+            device
+                .write_register_async(SyncWord { value: sync_word })
+                .await
+        })
+        .await?;
         self.execute_command(SetPacketParams {
             params: PacketParams::GFSK(GFSKPacketParams {
                 preamble_length: profile.preamble_bits,
@@ -280,11 +281,12 @@ where
         if usize::from(buffer_status.payload_length) != length {
             return Err(Error::InvalidPacketLength(buffer_status.payload_length));
         }
-        self.wait_while_busy().await?;
-        self.device
-            .read_buffer_async(buffer_status.buffer_pointer, &mut buffer[..length])
-            .await?;
-        self.check_command_status(OPCODE_READ_BUFFER).await?;
+        self.run_checked(OPCODE_READ_BUFFER, async |device| {
+            device
+                .read_buffer_async(buffer_status.buffer_pointer, &mut buffer[..length])
+                .await
+        })
+        .await?;
         let packet_status = self.execute_command(GetPacketStatus).await?.packet_status;
         Ok(PacketInfo {
             len: length,
@@ -385,10 +387,23 @@ where
     where
         C: Command<IdType = u8>,
     {
+        self.run_checked(C::id(), async |device| {
+            device.execute_command_async(command).await
+        })
+        .await
+    }
+
+    /// Waits for BUSY, runs one driver operation, then checks the radio status
+    /// reported for `opcode`.
+    async fn run_checked<T>(
+        &mut self,
+        opcode: u8,
+        operation: impl AsyncFnOnce(&mut Device<SPI>) -> Result<T, sx1262::Error<SPI::Error>>,
+    ) -> Result<T, Error<SPI::Error, BUSY::Error, IRQ::Error>> {
         self.wait_while_busy().await?;
-        let response = self.device.execute_command_async(command).await?;
-        self.check_command_status(C::id()).await?;
-        Ok(response)
+        let result = operation(&mut self.device).await?;
+        self.check_command_status(opcode).await?;
+        Ok(result)
     }
 }
 
