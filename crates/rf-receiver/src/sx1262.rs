@@ -163,11 +163,13 @@ where
         &mut self,
         profile: &FskProfile<'_>,
     ) -> Result<InitStatus, Error<SPI::Error, BUSY::Error, IRQ::Error>> {
+        let bandwidth =
+            GfskBandwidth::from_hz(profile.rx_bandwidth_hz).ok_or(Error::InvalidProfile)?;
+        // The image calibration below only covers this band.
         if !(863_000_000..=870_000_000).contains(&profile.frequency_hz)
-            || !(600..=300_000).contains(&profile.bit_rate)
-            || !(600..=200_000).contains(&profile.frequency_deviation_hz)
+            || !GfskModParams::BIT_RATE_BPS.contains(&profile.bit_rate)
+            || !GfskModParams::FREQ_DEVIATION_HZ.contains(&profile.frequency_deviation_hz)
             || profile.preamble_bits < 16
-            || profile.rx_bandwidth_hz != 117_300
             || profile.sync_word.len() != 2
             || profile.packet_length == 0
             || profile.crc_enabled
@@ -226,7 +228,7 @@ where
             params: ModulationParams::Gfsk(GfskModParams {
                 bit_rate: profile.bit_rate,
                 pulse_shape: GfskPulseShape::NoFilter,
-                bandwidth: GfskBandwidth::Bw1173,
+                bandwidth,
                 freq_deviation: profile.frequency_deviation_hz,
             }),
         })
@@ -786,6 +788,26 @@ mod tests {
                 assert!(radio.spi.commands.contains(&expected_frequency));
                 assert!(radio.spi.commands.contains(&expected_modulation));
             }
+        });
+    }
+
+    #[test]
+    fn maps_profile_bandwidth_to_driver_setting() {
+        block_on(async {
+            let mut radio = radio();
+            radio
+                .begin_fsk(&FskProfile {
+                    rx_bandwidth_hz: 156_200,
+                    ..WS90_868
+                })
+                .await
+                .unwrap();
+            assert!(
+                radio
+                    .spi
+                    .commands
+                    .contains(&vec![0x8b, 0x00, 0xe8, 0x8e, 0x00, 0x1a, 0x00, 0x8f, 0x5c])
+            );
         });
     }
 
