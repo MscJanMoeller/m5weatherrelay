@@ -20,7 +20,10 @@ use m5weatherrelay::{
     hardware::{init_io_expander, set_radio_front_end},
     ws90::WS90_868,
 };
-use rf_receiver::{Sx1262, sx1262::ReceiveEvent};
+use rf_receiver::{
+    Sx1262,
+    sx1262::{Error as RadioError, IRQ_ERRORS, IRQ_RX_DONE},
+};
 use ssd1306::{Ssd1306Async, mode::DisplayConfigAsync, size::DisplaySize64x48};
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -101,7 +104,7 @@ async fn main(_spawner: Spawner) {
     let mut next_poll = Instant::now() + Duration::from_secs(1);
     let mut next_heartbeat = Instant::now() + Duration::from_secs(10);
     loop {
-        let irq_woke = match select(radio.wait_for_irq(), Timer::at(next_poll)).await {
+        let irq_woke = match select(radio.wait_for_irq_pin(), Timer::at(next_poll)).await {
             Either::First(result) => {
                 result.expect("SX1262 IRQ pin wait failed");
                 true
@@ -115,36 +118,43 @@ async fn main(_spawner: Spawner) {
             .read_irq_flags()
             .await
             .expect("SX1262 IRQ read failed");
-        match radio
-            .handle_irq_flags(flags, &mut buffer)
-            .await
-            .expect("SX1262 receive handling failed")
-        {
-            ReceiveEvent::Pending if irq_woke => {
-                panic!("SX1262: DIO1 asserted without receive IRQ: 0x{:04x}", flags)
-            }
-            ReceiveEvent::Pending => {}
-            ReceiveEvent::RadioError(flags) => {
-                esp_println::println!("SX1262: receive error IRQ 0x{:04x}", flags);
-            }
-            ReceiveEvent::InvalidPacketLength(length) => {
-                esp_println::println!("SX1262: unexpected packet length {}", length);
-            }
-            ReceiveEvent::Packet(packet) => {
-                packets = packets.wrapping_add(1);
-                let rssi = -packet.rssi_half_dbm;
-                esp_println::print!(
-                    "SX1262: packet {} RSSI -{}.{} dBm IRQ 0x{:04x}: ",
-                    packets,
-                    rssi / 2,
-                    (rssi % 2) * 5,
-                    flags
-                );
-                for byte in &buffer[..packet.len] {
-                    esp_println::print!("{:02x}", byte);
+        if flags & IRQ_ERRORS != 0 {
+            esp_println::println!("SX1262: receive error IRQ 0x{:04x}", flags);
+            radio
+                .start_receive()
+                .await
+                .expect("SX1262 resume receiving failed");
+        } else if flags & IRQ_RX_DONE != 0 {
+            match radio.read_packet(&mut buffer).await {
+                Ok(packet) => {
+                    packets = packets.wrapping_add(1);
+                    let rssi = -packet.rssi_half_dbm;
+                    esp_println::print!(
+                        "SX1262: packet {} RSSI -{}.{} dBm IRQ 0x{:04x}: ",
+                        packets,
+                        rssi / 2,
+                        (rssi % 2) * 5,
+                        flags
+                    );
+                    for byte in &buffer[..packet.len] {
+                        esp_println::print!("{:02x}", byte);
+                    }
+                    esp_println::println!();
                 }
-                esp_println::println!();
+                Err(RadioError::InvalidPacketLength(length)) => {
+                    esp_println::println!("SX1262: unexpected packet length {}", length);
+                }
+                Err(error) => panic!("SX1262 packet read failed: {:?}", error),
             }
+            radio
+                .start_receive()
+                .await
+                .expect("SX1262 resume receiving failed");
+        } else if irq_woke {
+            panic!(
+                "SX1262: IRQ pin asserted without receive IRQ: 0x{:04x}",
+                flags
+            );
         }
         if Instant::now() >= next_heartbeat {
             next_heartbeat = Instant::now() + Duration::from_secs(10);
@@ -152,7 +162,7 @@ async fn main(_spawner: Spawner) {
                 "SX1262: listening; {} packets, IRQ 0x{:04x}, DIO1 {}",
                 packets,
                 flags,
-                radio.irq_is_high().expect("SX1262 IRQ pin read failed")
+                radio.irq_pin_is_high().expect("SX1262 IRQ pin read failed")
             );
         }
     }

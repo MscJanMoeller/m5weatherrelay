@@ -28,7 +28,10 @@ pub const IRQ_SYNC: u16 = IrqMask::SYNC_WORD_VALID.bits();
 pub const IRQ_HEADER_ERROR: u16 = IrqMask::HEADER_ERROR.bits();
 pub const IRQ_CRC_ERROR: u16 = IrqMask::CRC_ERROR.bits();
 pub const IRQ_TIMEOUT: u16 = IrqMask::TIMEOUT.bits();
-const IRQ_ERRORS: u16 = IRQ_HEADER_ERROR | IRQ_CRC_ERROR | IRQ_TIMEOUT;
+/// Flags that report a failed reception.
+pub const IRQ_ERRORS: u16 = IRQ_HEADER_ERROR | IRQ_CRC_ERROR | IRQ_TIMEOUT;
+/// Every IRQ flag bit, including bits this crate does not know.
+pub const IRQ_ALL: u16 = 0xffff;
 const IRQ_MASK: u16 = IRQ_RX_DONE | IRQ_PREAMBLE | IRQ_SYNC | IRQ_ERRORS;
 const IRQ_DIO1_MASK: u16 = IRQ_RX_DONE | IRQ_ERRORS;
 const BUSY_TIMEOUT_US: u32 = 250_000;
@@ -64,14 +67,6 @@ impl<S, B, I> From<sx1262::Error<S>> for Error<S, B, I> {
             }
         }
     }
-}
-
-/// Outcome after handling the IRQ flags returned by [`Sx1262::read_irq_flags`].
-pub enum ReceiveEvent {
-    Pending,
-    Packet(PacketInfo),
-    RadioError(u16),
-    InvalidPacketLength(u8),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -230,10 +225,7 @@ where
             return Err(Error::NotConfigured);
         }
         self.standby().await?;
-        self.execute_command(ClearIrqStatus {
-            irq_mask: IrqMask::from_bits_retain(0xffff),
-        })
-        .await?;
+        self.clear_irq_flags(IRQ_ALL).await?;
         self.execute_command(SetRx {
             mode: RxMode::Continuous,
         })
@@ -251,20 +243,40 @@ where
         Ok(())
     }
 
-    pub async fn wait_for_irq(&mut self) -> Result<(), Error<SPI::Error, BUSY::Error, IRQ::Error>> {
+    /// Waits until the IRQ pin (DIO1) goes high.
+    pub async fn wait_for_irq_pin(
+        &mut self,
+    ) -> Result<(), Error<SPI::Error, BUSY::Error, IRQ::Error>> {
         self.irq.wait_for_high().await.map_err(Error::IrqPin)
     }
 
-    pub fn irq_is_high(&mut self) -> Result<bool, IRQ::Error> {
+    /// Reads the level of the IRQ pin (DIO1).
+    pub fn irq_pin_is_high(&mut self) -> Result<bool, IRQ::Error> {
         self.irq.is_high()
     }
 
+    /// Reads the IRQ flags. They stay set, and keep the IRQ pin high, until
+    /// cleared with [`Self::clear_irq_flags`] or [`Self::start_receive`].
     pub async fn read_irq_flags(
         &mut self,
     ) -> Result<u16, Error<SPI::Error, BUSY::Error, IRQ::Error>> {
         Ok(self.execute_command(GetIrqStatus).await?.irq_mask.bits())
     }
 
+    /// Clears the given IRQ flags without changing the radio mode.
+    pub async fn clear_irq_flags(
+        &mut self,
+        flags: u16,
+    ) -> Result<(), Error<SPI::Error, BUSY::Error, IRQ::Error>> {
+        self.execute_command(ClearIrqStatus {
+            irq_mask: IrqMask::from_bits_retain(flags),
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Reads the received packet. This leaves the radio in standby; call
+    /// [`Self::start_receive`] to resume receiving.
     pub async fn read_packet(
         &mut self,
         buffer: &mut [u8],
@@ -294,33 +306,17 @@ where
         })
     }
 
-    /// Handle receive IRQs and rearm before returning a packet or receive error.
-    pub async fn handle_irq_flags(
-        &mut self,
-        flags: u16,
-        buffer: &mut [u8],
-    ) -> Result<ReceiveEvent, Error<SPI::Error, BUSY::Error, IRQ::Error>> {
-        if flags & IRQ_ERRORS != 0 {
-            self.start_receive().await?;
-            return Ok(ReceiveEvent::RadioError(flags));
-        }
-        if flags & IRQ_RX_DONE == 0 {
-            return Ok(ReceiveEvent::Pending);
-        }
-
-        let event = match self.read_packet(buffer).await {
-            Ok(packet) => ReceiveEvent::Packet(packet),
-            Err(Error::InvalidPacketLength(length)) => ReceiveEvent::InvalidPacketLength(length),
-            Err(error) => return Err(error),
-        };
-        self.start_receive().await?;
-        Ok(event)
-    }
-
-    /// Wait for and read one packet, rearming reception before returning.
+    /// Waits for the IRQ pin, then reads one packet and resumes receiving
+    /// before returning.
     ///
-    /// Dropping this future during SPI or rearming can leave the radio state
-    /// uncertain; restart and reconfigure it before reuse after cancellation.
+    /// Callers that need their own reaction to IRQ flags can combine
+    /// [`Self::wait_for_irq_pin`], [`Self::read_irq_flags`],
+    /// [`Self::read_packet`], [`Self::clear_irq_flags`] and
+    /// [`Self::start_receive`] instead.
+    ///
+    /// Dropping this future during SPI traffic or while resuming receiving can
+    /// leave the radio state uncertain; restart and reconfigure it before reuse
+    /// after cancellation.
     pub async fn receive(
         &mut self,
         buffer: &mut [u8],
@@ -335,14 +331,20 @@ where
                 available: buffer.len(),
             });
         }
-        self.wait_for_irq().await?;
+        self.wait_for_irq_pin().await?;
         let flags = self.read_irq_flags().await?;
-        match self.handle_irq_flags(flags, buffer).await? {
-            ReceiveEvent::Packet(packet) => Ok(packet),
-            ReceiveEvent::RadioError(flags) => Err(Error::ReceiveIrq(flags)),
-            ReceiveEvent::InvalidPacketLength(length) => Err(Error::InvalidPacketLength(length)),
-            ReceiveEvent::Pending => Err(Error::UnexpectedIrq(flags)),
+        if flags & IRQ_ERRORS != 0 {
+            self.start_receive().await?;
+            return Err(Error::ReceiveIrq(flags));
         }
+        if flags & IRQ_RX_DONE == 0 {
+            return Err(Error::UnexpectedIrq(flags));
+        }
+        let packet = self.read_packet(buffer).await;
+        if matches!(packet, Ok(_) | Err(Error::InvalidPacketLength(_))) {
+            self.start_receive().await?;
+        }
+        packet
     }
 
     async fn wait_while_busy(&mut self) -> Result<(), Error<SPI::Error, BUSY::Error, IRQ::Error>> {
@@ -916,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_packet_and_rearms() {
+    fn reads_packet_and_resumes_receiving() {
         block_on(async {
             let mut radio = radio();
             let mut buffer = [0; 64];
@@ -1042,26 +1044,39 @@ mod tests {
     }
 
     #[test]
-    fn handles_receive_events_and_rearms() {
+    fn clears_requested_irq_flags_without_leaving_receive_mode() {
+        block_on(async {
+            let mut radio = radio();
+            radio
+                .clear_irq_flags(IRQ_RX_DONE | IRQ_CRC_ERROR)
+                .await
+                .unwrap();
+            assert_eq!(radio.device.spi().commands, vec![vec![0x02, 0x00, 0x42]]);
+            assert!(radio.receiving);
+        });
+    }
+
+    #[test]
+    fn reports_irq_pin_level() {
+        let irq = ControlledPin::default();
+        let mut radio = Sx1262::new(
+            MockSpi::default(),
+            MockBusy::default(),
+            irq.clone(),
+            MockDelay::default(),
+        );
+        assert_eq!(radio.irq_pin_is_high(), Ok(false));
+        irq.set_high(true);
+        assert_eq!(radio.irq_pin_is_high(), Ok(true));
+    }
+
+    #[test]
+    fn receive_resumes_receiving_after_packet_and_radio_events() {
         block_on(async {
             let mut radio = radio();
             let mut buffer = [0; 64];
-            assert!(matches!(
-                radio
-                    .handle_irq_flags(IRQ_PREAMBLE | IRQ_SYNC, &mut buffer)
-                    .await,
-                Ok(ReceiveEvent::Pending)
-            ));
-            assert!(radio.device.spi().commands.is_empty());
-
-            let packet = match radio
-                .handle_irq_flags(IRQ_RX_DONE, &mut buffer)
-                .await
-                .unwrap()
-            {
-                ReceiveEvent::Packet(packet) => packet,
-                _ => panic!("expected packet"),
-            };
+            radio.device.spi_mut().irq_flags = IRQ_RX_DONE;
+            let packet = radio.receive(&mut buffer).await.unwrap();
             assert_eq!(packet.len, 64);
             assert_eq!(buffer[63], 63);
             assert_eq!(
@@ -1071,10 +1086,10 @@ mod tests {
 
             radio.device.spi_mut().commands.clear();
             radio.device.spi_mut().length = 63;
-            assert!(matches!(
-                radio.handle_irq_flags(IRQ_RX_DONE, &mut buffer).await,
-                Ok(ReceiveEvent::InvalidPacketLength(63))
-            ));
+            assert_eq!(
+                radio.receive(&mut buffer).await,
+                Err(Error::InvalidPacketLength(63))
+            );
             assert!(!radio.device.spi().commands.iter().any(|cmd| cmd[0] == 0x1e));
             assert_eq!(
                 radio.device.spi().commands.last().unwrap(),
@@ -1082,10 +1097,11 @@ mod tests {
             );
 
             radio.device.spi_mut().commands.clear();
-            assert!(matches!(
-                radio.handle_irq_flags(IRQ_RX_DONE | IRQ_CRC_ERROR, &mut buffer).await,
-                Ok(ReceiveEvent::RadioError(flags)) if flags == IRQ_RX_DONE | IRQ_CRC_ERROR
-            ));
+            radio.device.spi_mut().irq_flags = IRQ_RX_DONE | IRQ_CRC_ERROR;
+            assert_eq!(
+                radio.receive(&mut buffer).await,
+                Err(Error::ReceiveIrq(IRQ_RX_DONE | IRQ_CRC_ERROR))
+            );
             assert!(!radio.device.spi().commands.iter().any(|cmd| cmd[0] == 0x13));
             assert_eq!(
                 radio.device.spi().commands.last().unwrap(),
@@ -1093,8 +1109,9 @@ mod tests {
             );
 
             radio.device.spi_mut().fail_opcode = Some(0x82);
+            radio.device.spi_mut().irq_flags = IRQ_TIMEOUT;
             assert!(matches!(
-                radio.handle_irq_flags(IRQ_TIMEOUT, &mut buffer).await,
+                radio.receive(&mut buffer).await,
                 Err(Error::Spi(spi::ErrorKind::Other))
             ));
         });
@@ -1161,7 +1178,7 @@ mod tests {
     }
 
     #[test]
-    fn receive_waits_for_irq_wakeup_and_rearms() {
+    fn receive_waits_for_irq_pin_and_resumes_receiving() {
         use core::future::Future;
 
         let irq = ControlledPin::default();
