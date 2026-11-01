@@ -26,13 +26,17 @@ Buzzer and RGB data pins are held low.
 
 The receive-only `rf-receiver` crate uses async embedded-hal SPI,
 GPIO waits and delays, and follows RadioLib concepts (`init_fsk`,
-`start_receive`, `read_packet`). Its `receive` method awaits a packet and
-resumes receiving before returning. For its own reaction to IRQ flags the
-firmware uses the lower-level `wait_for_irq_pin`, `read_irq_flags`,
-`clear_irq_flags`, `read_packet` and `start_receive`, which also retains
-diagnostics. `read_packet` leaves the radio in standby, so call `start_receive`
-afterwards. Do not cancel `receive` during SPI traffic or while resuming
-receiving without reinitializing the radio.
+`start_receive`, `read_packet`). `start_receive` enters continuous receive
+mode, so the radio keeps receiving after each packet, as with RadioLib's
+`startReceive` and `readData`. Its `receive` method awaits the IRQ pin and
+reads one packet. For its own reaction to IRQ flags the firmware uses the
+lower-level `wait_for_irq_pin`, `read_irq_flags`, `read_packet` and
+`clear_irq_flags`, which also retains diagnostics. `read_packet` clears the
+packet flags first and reports `PacketOverrun` if the next packet starts
+arriving while the buffer is read; error flags are left for the caller to
+clear. Use `standby` and `start_receive` to stop and restart receiving. Do not
+cancel `receive` during SPI traffic without checking that the radio still
+receives.
 The OLED and radio share the same async SPI bus.
 
 The `FskProfile` and caller-owned receive buffer are chip-neutral; GPIO wiring,

@@ -121,9 +121,9 @@ async fn main(_spawner: Spawner) {
         if flags & IRQ_ERRORS != 0 {
             esp_println::println!("SX1262: receive error IRQ 0x{:04x}", flags);
             radio
-                .start_receive()
+                .clear_irq_flags(flags)
                 .await
-                .expect("SX1262 resume receiving failed");
+                .expect("SX1262 IRQ clear failed");
         } else if flags & IRQ_RX_DONE != 0 {
             match radio.read_packet(&mut buffer).await {
                 Ok(packet) => {
@@ -144,12 +144,11 @@ async fn main(_spawner: Spawner) {
                 Err(RadioError::InvalidPacketLength(length)) => {
                     esp_println::println!("SX1262: unexpected packet length {}", length);
                 }
+                Err(RadioError::PacketOverrun) => {
+                    esp_println::println!("SX1262: packet dropped, next packet overwrote it");
+                }
                 Err(error) => panic!("SX1262 packet read failed: {:?}", error),
             }
-            radio
-                .start_receive()
-                .await
-                .expect("SX1262 resume receiving failed");
         } else if irq_woke {
             panic!(
                 "SX1262: IRQ pin asserted without receive IRQ: 0x{:04x}",
