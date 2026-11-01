@@ -68,7 +68,7 @@ pub struct InitStatus {
 }
 
 pub struct Sx1262<SPI, BUSY, IRQ, DELAY> {
-    spi: SPI,
+    device: Device<SPI>,
     busy: BUSY,
     irq: IRQ,
     delay: DELAY,
@@ -85,7 +85,7 @@ where
 {
     pub fn new(spi: SPI, busy: BUSY, irq: IRQ, delay: DELAY) -> Self {
         Self {
-            spi,
+            device: Device::new(spi),
             busy,
             irq,
             delay,
@@ -112,7 +112,8 @@ where
     ) -> Result<(), Error<SPI::Error, BUSY::Error, IRQ::Error>> {
         self.delay.delay_us(1).await;
         self.wait_ready().await?;
-        let status = Device::new(&mut self.spi)
+        let status = self
+            .device
             .execute_command_async(GetRawStatus)
             .await
             .map_err(Self::driver_error)?;
@@ -139,7 +140,8 @@ where
         C: Command<IdType = u8>,
     {
         self.wait_ready().await?;
-        let response = Device::new(&mut self.spi)
+        let response = self
+            .device
             .execute_command_async(command)
             .await
             .map_err(Self::driver_error)?;
@@ -236,7 +238,7 @@ where
         let mut sync_word = [0; 8];
         sync_word[..profile.sync_word.len()].copy_from_slice(profile.sync_word);
         self.wait_ready().await?;
-        Device::new(&mut self.spi)
+        self.device
             .write_register_async(SyncWord { value: sync_word })
             .await
             .map_err(Self::driver_error)?;
@@ -335,7 +337,7 @@ where
             return Err(Error::InvalidPacketLength(buffer_status.payload_length));
         }
         self.wait_ready().await?;
-        Device::new(&mut self.spi)
+        self.device
             .read_buffer_async(buffer_status.buffer_pointer, &mut buffer[..length])
             .await
             .map_err(Self::driver_error)?;
@@ -713,7 +715,7 @@ mod tests {
             let mut radio = radio();
             radio.begin_fsk(&WS90_868).await.unwrap();
             assert_eq!(
-                radio.spi.commands,
+                radio.device.spi().commands,
                 vec![
                     vec![0x80, 0x00],
                     vec![0x17, 0],
@@ -747,13 +749,15 @@ mod tests {
                 .unwrap();
             assert!(
                 radio
-                    .spi
+                    .device
+                    .spi()
                     .commands
                     .contains(&vec![0x0d, 0x06, 0xc0, 0xab, 0xcd, 0, 0, 0, 0, 0, 0])
             );
             assert!(
                 radio
-                    .spi
+                    .device
+                    .spi()
                     .commands
                     .contains(&vec![0x8c, 0, 48, 5, 16, 0, 0, 64, 1, 0])
             );
@@ -785,8 +789,8 @@ mod tests {
                 expected_modulation.extend_from_slice(&bitrate_bytes.to_be_bytes()[1..]);
                 expected_modulation.extend_from_slice(&[0x00, 0x0b]);
                 expected_modulation.extend_from_slice(&deviation_bytes.to_be_bytes()[1..]);
-                assert!(radio.spi.commands.contains(&expected_frequency));
-                assert!(radio.spi.commands.contains(&expected_modulation));
+                assert!(radio.device.spi().commands.contains(&expected_frequency));
+                assert!(radio.device.spi().commands.contains(&expected_modulation));
             }
         });
     }
@@ -804,7 +808,8 @@ mod tests {
                 .unwrap();
             assert!(
                 radio
-                    .spi
+                    .device
+                    .spi()
                     .commands
                     .contains(&vec![0x8b, 0x00, 0xe8, 0x8e, 0x00, 0x1a, 0x00, 0x8f, 0x5c])
             );
@@ -854,7 +859,7 @@ mod tests {
                 },
             ] {
                 assert_eq!(radio.begin_fsk(&profile).await, Err(Error::InvalidProfile));
-                assert!(radio.spi.commands.is_empty());
+                assert!(radio.device.spi().commands.is_empty());
             }
         });
     }
@@ -864,7 +869,7 @@ mod tests {
         block_on(async {
             let mut radio = radio();
             let mut buffer = [0; 64];
-            radio.spi.irq_flags = IRQ_PREAMBLE | IRQ_SYNC | IRQ_RX_DONE;
+            radio.device.spi_mut().irq_flags = IRQ_PREAMBLE | IRQ_SYNC | IRQ_RX_DONE;
             radio.start_receive().await.unwrap();
             assert_eq!(radio.get_irq_flags().await.unwrap(), 0x0e);
             let packet = radio.read_data(&mut buffer).await.unwrap();
@@ -874,7 +879,7 @@ mod tests {
             assert_eq!(packet.rssi_half_dbm, -103);
             radio.start_receive().await.unwrap();
             assert_eq!(
-                radio.spi.commands,
+                radio.device.spi().commands,
                 vec![
                     vec![0x80, 0],
                     vec![0x02, 0xff, 0xff],
@@ -896,7 +901,7 @@ mod tests {
     fn reports_invalid_response_status_and_retains_unknown_irq_bits() {
         block_on(async {
             let mut radio = radio();
-            radio.spi.response_status = Some(0);
+            radio.device.spi_mut().response_status = Some(0);
             assert_eq!(
                 radio.get_irq_flags().await,
                 Err(Error::DriverDeserializationError {
@@ -904,8 +909,8 @@ mod tests {
                     first_byte: Some(0),
                 })
             );
-            radio.spi.response_status = None;
-            radio.spi.irq_flags = 0x8200;
+            radio.device.spi_mut().response_status = None;
+            radio.device.spi_mut().irq_flags = 0x8200;
             assert_eq!(radio.get_irq_flags().await, Ok(0x8200));
         });
     }
@@ -914,7 +919,7 @@ mod tests {
     fn reports_initialization_response_details() {
         block_on(async {
             let mut radio = radio();
-            radio.spi.response_status = Some(0);
+            radio.device.spi_mut().response_status = Some(0);
             assert_eq!(
                 radio.begin_fsk(&WS90_868).await,
                 Err(Error::DriverDeserializationError {
@@ -929,7 +934,7 @@ mod tests {
     fn accepts_radio_response_with_reserved_command_status() {
         block_on(async {
             let mut radio = radio();
-            radio.spi.response_status = Some(0xa2);
+            radio.device.spi_mut().response_status = Some(0xa2);
             assert!(radio.begin_fsk(&WS90_868).await.is_ok());
         });
     }
@@ -938,45 +943,45 @@ mod tests {
     fn preserves_spi_errors_from_driver_operations() {
         block_on(async {
             let mut radio = radio();
-            radio.spi.fail_opcode = Some(0x80);
+            radio.device.spi_mut().fail_opcode = Some(0x80);
             assert_eq!(
                 radio.standby().await,
                 Err(Error::Spi(spi::ErrorKind::Other))
             );
-            radio.spi.fail_opcode = Some(0x1e);
+            radio.device.spi_mut().fail_opcode = Some(0x1e);
             let mut buffer = [0; 64];
             assert_eq!(
                 radio.read_data(&mut buffer).await,
                 Err(Error::Spi(spi::ErrorKind::Other))
             );
 
-            radio.spi.fail_opcode = Some(0x02);
+            radio.device.spi_mut().fail_opcode = Some(0x02);
             assert_eq!(
                 radio.start_receive().await,
                 Err(Error::Spi(spi::ErrorKind::Other))
             );
-            radio.spi.fail_opcode = Some(0x13);
+            radio.device.spi_mut().fail_opcode = Some(0x13);
             assert_eq!(
                 radio.read_data(&mut buffer).await,
                 Err(Error::Spi(spi::ErrorKind::Other))
             );
-            radio.spi.fail_opcode = Some(0xc0);
+            radio.device.spi_mut().fail_opcode = Some(0xc0);
             assert_eq!(
                 radio.standby().await,
                 Err(Error::Spi(spi::ErrorKind::Other))
             );
-            radio.spi.fail_opcode = Some(0x0d);
+            radio.device.spi_mut().fail_opcode = Some(0x0d);
             assert_eq!(
                 radio.begin_fsk(&WS90_868).await,
                 Err(Error::Spi(spi::ErrorKind::Other))
             );
-            radio.spi.fail_opcode = Some(0x08);
+            radio.device.spi_mut().fail_opcode = Some(0x08);
             assert_eq!(
                 radio.begin_fsk(&WS90_868).await,
                 Err(Error::Spi(spi::ErrorKind::Other))
             );
             assert_eq!(radio.packet_length, None);
-            radio.spi.fail_opcode = Some(0x97);
+            radio.device.spi_mut().fail_opcode = Some(0x97);
             assert_eq!(
                 radio.begin_fsk(&WS90_868).await,
                 Err(Error::Spi(spi::ErrorKind::Other))
@@ -995,12 +1000,13 @@ mod tests {
             radio.begin_fsk(&profile).await.unwrap();
             assert!(
                 radio
-                    .spi
+                    .device
+                    .spi()
                     .commands
                     .iter()
                     .any(|cmd| cmd == &[0x8c, 0, 48, 5, 16, 0, 0, 5, 1, 0])
             );
-            radio.spi.length = 5;
+            radio.device.spi_mut().length = 5;
             let mut buffer = [0xff; 8];
             let packet = radio.read_data(&mut buffer).await.unwrap();
             assert_eq!(packet.len, 5);
@@ -1017,7 +1023,7 @@ mod tests {
                 radio.handle_irq(IRQ_PREAMBLE | IRQ_SYNC, &mut buffer).await,
                 Ok(ReceiveEvent::Pending)
             ));
-            assert!(radio.spi.commands.is_empty());
+            assert!(radio.device.spi().commands.is_empty());
 
             let packet = match radio.handle_irq(IRQ_RX_DONE, &mut buffer).await.unwrap() {
                 ReceiveEvent::Packet(packet) => packet,
@@ -1026,34 +1032,34 @@ mod tests {
             assert_eq!(packet.len, 64);
             assert_eq!(buffer[63], 63);
             assert_eq!(
-                radio.spi.commands.last().unwrap(),
+                radio.device.spi().commands.last().unwrap(),
                 &[0x82, 0xff, 0xff, 0xff]
             );
 
-            radio.spi.commands.clear();
-            radio.spi.length = 63;
+            radio.device.spi_mut().commands.clear();
+            radio.device.spi_mut().length = 63;
             assert!(matches!(
                 radio.handle_irq(IRQ_RX_DONE, &mut buffer).await,
                 Ok(ReceiveEvent::InvalidPacketLength(63))
             ));
-            assert!(!radio.spi.commands.iter().any(|cmd| cmd[0] == 0x1e));
+            assert!(!radio.device.spi().commands.iter().any(|cmd| cmd[0] == 0x1e));
             assert_eq!(
-                radio.spi.commands.last().unwrap(),
+                radio.device.spi().commands.last().unwrap(),
                 &[0x82, 0xff, 0xff, 0xff]
             );
 
-            radio.spi.commands.clear();
+            radio.device.spi_mut().commands.clear();
             assert!(matches!(
                 radio.handle_irq(IRQ_RX_DONE | IRQ_CRC_ERROR, &mut buffer).await,
                 Ok(ReceiveEvent::RadioError(flags)) if flags == IRQ_RX_DONE | IRQ_CRC_ERROR
             ));
-            assert!(!radio.spi.commands.iter().any(|cmd| cmd[0] == 0x13));
+            assert!(!radio.device.spi().commands.iter().any(|cmd| cmd[0] == 0x13));
             assert_eq!(
-                radio.spi.commands.last().unwrap(),
+                radio.device.spi().commands.last().unwrap(),
                 &[0x82, 0xff, 0xff, 0xff]
             );
 
-            radio.spi.fail_opcode = Some(0x82);
+            radio.device.spi_mut().fail_opcode = Some(0x82);
             assert!(matches!(
                 radio.handle_irq(IRQ_TIMEOUT, &mut buffer).await,
                 Err(Error::Spi(spi::ErrorKind::Other))
@@ -1066,13 +1072,13 @@ mod tests {
         block_on(async {
             let mut radio = radio();
             let mut buffer = [0; 64];
-            radio.spi.length = 63;
+            radio.device.spi_mut().length = 63;
             assert!(matches!(
                 radio.read_data(&mut buffer).await,
                 Err(Error::InvalidPacketLength(63))
             ));
-            assert!(!radio.spi.commands.iter().any(|cmd| cmd[0] == 0x1e));
-            radio.spi.calibration_errors = 0x10;
+            assert!(!radio.device.spi().commands.iter().any(|cmd| cmd[0] == 0x1e));
+            radio.device.spi_mut().calibration_errors = 0x10;
             assert_eq!(
                 radio.begin_fsk(&WS90_868).await,
                 Err(Error::DeviceErrors(0x10))
@@ -1084,16 +1090,16 @@ mod tests {
     fn clears_only_the_expected_pre_tcxo_oscillator_error() {
         block_on(async {
             let mut radio = radio();
-            radio.spi.device_errors = 0x20;
+            radio.device.spi_mut().device_errors = 0x20;
             assert_eq!(
                 radio.begin_fsk(&WS90_868).await,
                 Ok(InitStatus {
                     cleared_xosc_start_error: true
                 })
             );
-            assert_eq!(radio.spi.commands[2], [0x07, 0, 0]);
+            assert_eq!(radio.device.spi().commands[2], [0x07, 0, 0]);
 
-            radio.spi.device_errors = 0x21;
+            radio.device.spi_mut().device_errors = 0x21;
             assert_eq!(
                 radio.begin_fsk(&WS90_868).await,
                 Err(Error::DeviceErrors(0x21))
@@ -1108,7 +1114,7 @@ mod tests {
             radio.busy.high = true;
             assert_eq!(radio.start_receive().await, Err(Error::BusyTimeout));
             assert_eq!(radio.delay.nanos, 250_000_000);
-            assert!(radio.spi.commands.is_empty());
+            assert!(radio.device.spi().commands.is_empty());
             radio.busy.high = false;
             radio.busy.fail = true;
             assert_eq!(
@@ -1116,21 +1122,21 @@ mod tests {
                 Err(Error::BusyPin(digital::ErrorKind::Other))
             );
             radio.busy.fail = false;
-            radio.spi.fail_opcode = Some(0x80);
+            radio.device.spi_mut().fail_opcode = Some(0x80);
             assert_eq!(
                 radio.start_receive().await,
                 Err(Error::Spi(spi::ErrorKind::Other))
             );
-            radio.spi.fail_opcode = None;
+            radio.device.spi_mut().fail_opcode = None;
             for status in [0x00, 0xff] {
-                radio.spi.status = status;
+                radio.device.spi_mut().status = status;
                 assert_eq!(
                     radio.start_receive().await,
                     Err(Error::InvalidStatus(status))
                 );
             }
             for status in [0x26, 0x28, 0x2a] {
-                radio.spi.status = status;
+                radio.device.spi_mut().status = status;
                 assert_eq!(
                     radio.start_receive().await,
                     Err(Error::CommandFailed {
@@ -1155,7 +1161,7 @@ mod tests {
         );
         radio.packet_length = Some(64);
         radio.receiving = true;
-        radio.spi.irq_flags = IRQ_RX_DONE;
+        radio.device.spi_mut().irq_flags = IRQ_RX_DONE;
         let mut buffer = [0; 64];
         let counter = Arc::new(WakeCounter::default());
         let waker = Waker::from(counter.clone());
@@ -1174,7 +1180,7 @@ mod tests {
         }
         assert_eq!(buffer[63], 63);
         assert_eq!(
-            radio.spi.commands.last().unwrap(),
+            radio.device.spi().commands.last().unwrap(),
             &[0x82, 0xff, 0xff, 0xff]
         );
         assert!(radio.receiving);
@@ -1224,20 +1230,20 @@ mod tests {
                     available: 63
                 })
             );
-            assert!(radio.spi.commands.is_empty());
+            assert!(radio.device.spi().commands.is_empty());
             radio.irq.fail = true;
             assert_eq!(
                 radio.receive(&mut buffer).await,
                 Err(Error::IrqPin(digital::ErrorKind::Other))
             );
             radio.irq.fail = false;
-            radio.spi.irq_flags = IRQ_CRC_ERROR;
+            radio.device.spi_mut().irq_flags = IRQ_CRC_ERROR;
             assert_eq!(
                 radio.receive(&mut buffer).await,
                 Err(Error::ReceiveIrq(IRQ_CRC_ERROR))
             );
             assert!(radio.receiving);
-            radio.spi.irq_flags = 0;
+            radio.device.spi_mut().irq_flags = 0;
             assert_eq!(
                 radio.receive(&mut buffer).await,
                 Err(Error::UnexpectedIrq(0))
