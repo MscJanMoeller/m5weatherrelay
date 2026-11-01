@@ -90,12 +90,28 @@ pub struct InitStatus {
     pub cleared_xosc_start_error: bool,
 }
 
+/// Receive-only SX1262 radio for fixed-length GFSK packets.
+///
+/// Call [`Self::init_fsk`] and then [`Self::start_receive`] before reading
+/// packets.
 pub struct Sx1262<SPI, BUSY, IRQ, DELAY> {
+    /// Driver wrapper that owns the SPI device; all radio traffic goes
+    /// through it.
     device: Device<SPI>,
+    /// BUSY pin. The radio holds it high while it processes a command, so it
+    /// is awaited low before every SPI transfer.
     busy: BUSY,
+    /// IRQ pin, wired to DIO1. It is mapped to RX done and the error flags
+    /// and stays high until those flags are cleared.
     irq: IRQ,
+    /// Delay source for the BUSY wait timeout and the pauses around status
+    /// reads.
     delay: DELAY,
+    /// Packet length of the profile set by [`Self::init_fsk`]; `None` until
+    /// the radio is configured.
     packet_length: Option<u8>,
+    /// Whether the radio is in receive mode: set by [`Self::start_receive`]
+    /// and cleared by [`Self::standby`] and [`Self::init_fsk`].
     receiving: bool,
 }
 
