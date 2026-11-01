@@ -7,14 +7,21 @@ license = "MIT"
 publish = false
 
 [workspace]
-members = ["crates/rf-receiver"]
+members = ["crates/rf-receiver", "crates/rf-sensor", "crates/rf-ecowitt"]
 resolver = "3"
+
+[features]
+ws90-433 = []
+ws90-915 = []
+ws90-920 = []
 
 [dependencies]
 display-interface = "0.5"
 embedded-hal = "1"
 embassy-futures = "0.1"
+rf-ecowitt = { path = "crates/rf-ecowitt" }
 rf-receiver = { path = "crates/rf-receiver" }
+rf-sensor = { path = "crates/rf-sensor" }
 ssd1306 = { version = "0.10", features = ["async"] }
 
 [target.'cfg(target_arch = "riscv32")'.dependencies]

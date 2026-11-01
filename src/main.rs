@@ -16,9 +16,10 @@ use esp_hal::{
     timer::timg::TimerGroup,
 };
 use m5weatherrelay::{
+    config::selected_profile,
     display::{DISPLAY_ROTATION, write_text},
     hardware::{RADIO_BOARD, init_io_expander, set_radio_front_end},
-    ws90::WS90_868,
+    sensor_registry,
 };
 use rf_receiver::{
     Sx1262,
@@ -84,9 +85,11 @@ async fn main(_spawner: Spawner) {
     Timer::after(Duration::from_millis(100)).await;
     set_radio_front_end(&mut i2c, true, false).expect("Radio reset release failed");
     Timer::after(Duration::from_millis(10)).await;
+    let registry = sensor_registry::registry().expect("RF registry initialization failed");
+    let profile = selected_profile(&registry).expect("RF profile selection failed");
     let mut radio = Sx1262::new(radio_spi, radio_busy, radio_irq, Delay).with_board(RADIO_BOARD);
     radio
-        .init_fsk(&WS90_868)
+        .init_fsk(profile.fsk())
         .await
         .expect("SX1262 initialization failed");
     set_radio_front_end(&mut i2c, true, true).expect("Radio front-end enable failed");
@@ -94,10 +97,13 @@ async fn main(_spawner: Spawner) {
         .start_receive()
         .await
         .expect("SX1262 start receive failed");
-    esp_println::println!("SX1262: listening for raw FSK packets at 868.350 MHz");
+    esp_println::println!(
+        "SX1262: listening for FSK packets at {} Hz",
+        profile.fsk().frequency_hz
+    );
 
     let mut packets = 0u32;
-    let mut buffer = [0; 64];
+    let mut buffer = [0; u8::MAX as usize];
     let mut heartbeat = Ticker::every(Duration::from_secs(10));
     loop {
         // The radio keeps DIO1 high until the IRQ flags are cleared, so no pin change is missed.
@@ -138,6 +144,24 @@ async fn main(_spawner: Spawner) {
                         esp_println::print!("{:02x}", byte);
                     }
                     esp_println::println!();
+                    match profile.decode(&buffer[..packet.len], |invalid| {
+                        esp_println::println!(
+                            "{} {}: invalid packet: {:?}",
+                            invalid.model.vendor,
+                            invalid.model.model_id,
+                            invalid.error
+                        );
+                    }) {
+                        Ok(decoded) => esp_println::println!(
+                            "{} {}: {:?}",
+                            decoded.model.vendor,
+                            decoded.model.model_id,
+                            decoded.data
+                        ),
+                        Err(error) => {
+                            esp_println::println!("{}: rejected packet: {:?}", profile.id(), error)
+                        }
+                    }
                 }
                 Err(RadioError::InvalidPacketLength(length)) => {
                     esp_println::println!("SX1262: unexpected packet length {}", length);

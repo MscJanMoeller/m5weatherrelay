@@ -1022,7 +1022,9 @@ dependencies = [
  "esp-hal",
  "esp-println",
  "esp-rtos",
+ "rf-ecowitt",
  "rf-receiver",
+ "rf-sensor",
  "ssd1306",
 ]
 
@@ -1202,6 +1204,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rf-ecowitt"
+version = "0.1.0"
+dependencies = [
+ "rf-sensor",
+]
+
+[[package]]
 name = "rf-receiver"
 version = "0.1.0"
 dependencies = [
@@ -1209,8 +1218,13 @@ dependencies = [
  "embedded-hal 1.0.0",
  "embedded-hal-async",
  "regiface",
+ "rf-sensor",
  "sx1262",
 ]
+
+[[package]]
+name = "rf-sensor"
+version = "0.1.0"
 
 [[package]]
 name = "riscv"

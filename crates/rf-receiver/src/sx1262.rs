@@ -1,6 +1,6 @@
 //! SX1262-specific control and diagnostics.
 
-use crate::{CrcConfig, CrcLength, FskProfile, PacketInfo};
+use crate::{CrcConfig, CrcLength, FskSettings, PacketInfo};
 use core::{convert::Infallible, ops::RangeInclusive};
 use embassy_futures::select::{Either, select};
 use embedded_hal::digital::InputPin;
@@ -49,7 +49,7 @@ const BUSY_RISE_DELAY_US: u32 = 1;
 const TCXO_STARTUP_DELAY_STEPS: u32 = 320;
 
 /// How the board supplies the radio's clock and core voltage. These depend on the PCB,
-/// not on the radio link, so they belong to the receiver and not to the `FskProfile`.
+/// not on the radio link, so they belong to the receiver and not to the `FskSettings`.
 #[derive(Debug, Clone, Copy)]
 pub struct BoardConfig {
     /// Voltage the radio supplies to a TCXO through DIO3, or `None` for a plain crystal.
@@ -172,7 +172,7 @@ where
 
     pub async fn init_fsk(
         &mut self,
-        profile: &FskProfile<'_>,
+        profile: &FskSettings<'_>,
     ) -> Result<(), Error<SPI::Error, BUSY::Error, IRQ::Error>> {
         let bandwidth =
             GfskBandwidth::from_hz(profile.rx_bandwidth_hz).ok_or(Error::InvalidProfile)?;
@@ -561,7 +561,7 @@ mod tests {
         vec::Vec,
     };
 
-    const WS90_868: FskProfile<'static> = FskProfile {
+    const WS90_868: FskSettings<'static> = FskSettings {
         frequency_hz: 868_350_000,
         bit_rate: 17_200,
         frequency_deviation_hz: 35_000,
@@ -912,7 +912,7 @@ mod tests {
             for (preamble_bits, sync_word, expected) in cases {
                 let mut radio = radio();
                 radio
-                    .init_fsk(&FskProfile {
+                    .init_fsk(&FskSettings {
                         preamble_bits,
                         sync_word,
                         ..WS90_868
@@ -946,7 +946,7 @@ mod tests {
         block_on(async {
             let mut radio = radio();
             radio
-                .init_fsk(&FskProfile {
+                .init_fsk(&FskSettings {
                     crc: Some(CrcConfig::CCITT),
                     ..WS90_868
                 })
@@ -975,7 +975,7 @@ mod tests {
             ] {
                 let mut radio = radio();
                 radio
-                    .init_fsk(&FskProfile {
+                    .init_fsk(&FskSettings {
                         crc: Some(CrcConfig {
                             length,
                             initial: 0xffff,
@@ -1000,7 +1000,7 @@ mod tests {
             let mut radio = radio();
             radio.device.spi_mut().whitening_register = 0x1234;
             radio
-                .init_fsk(&FskProfile {
+                .init_fsk(&FskSettings {
                     whitening: Some(WhiteningConfig { initial: 0x00a5 }),
                     ..WS90_868
                 })
@@ -1023,7 +1023,7 @@ mod tests {
         block_on(async {
             let mut radio = radio();
             radio
-                .init_fsk(&FskProfile {
+                .init_fsk(&FskSettings {
                     crc: Some(CrcConfig::default()),
                     whitening: Some(WhiteningConfig::default()),
                     ..WS90_868
@@ -1044,7 +1044,7 @@ mod tests {
             {
                 let mut radio = radio();
                 radio
-                    .init_fsk(&FskProfile {
+                    .init_fsk(&FskSettings {
                         frequency_hz: frequency,
                         bit_rate,
                         frequency_deviation_hz: deviation,
@@ -1072,7 +1072,7 @@ mod tests {
         block_on(async {
             let mut radio = radio();
             radio
-                .init_fsk(&FskProfile {
+                .init_fsk(&FskSettings {
                     rx_bandwidth_hz: 156_200,
                     ..WS90_868
                 })
@@ -1101,7 +1101,7 @@ mod tests {
             ] {
                 let mut radio = radio();
                 radio
-                    .init_fsk(&FskProfile {
+                    .init_fsk(&FskSettings {
                         frequency_hz: frequency,
                         ..WS90_868
                     })
@@ -1124,47 +1124,47 @@ mod tests {
         block_on(async {
             let mut radio = radio();
             for profile in [
-                FskProfile {
+                FskSettings {
                     frequency_hz: 149_999_999,
                     ..WS90_868
                 },
-                FskProfile {
+                FskSettings {
                     frequency_hz: 960_000_001,
                     ..WS90_868
                 },
-                FskProfile {
+                FskSettings {
                     bit_rate: 0,
                     ..WS90_868
                 },
-                FskProfile {
+                FskSettings {
                     frequency_deviation_hz: 0,
                     ..WS90_868
                 },
-                FskProfile {
+                FskSettings {
                     preamble_bits: 0,
                     ..WS90_868
                 },
-                FskProfile {
+                FskSettings {
                     rx_bandwidth_hz: 125_000,
                     ..WS90_868
                 },
-                FskProfile {
+                FskSettings {
                     sync_word: &[],
                     ..WS90_868
                 },
-                FskProfile {
+                FskSettings {
                     sync_word: &[0; 9],
                     ..WS90_868
                 },
-                FskProfile {
+                FskSettings {
                     packet_length: 0,
                     ..WS90_868
                 },
-                FskProfile {
+                FskSettings {
                     whitening: Some(WhiteningConfig { initial: 0x0200 }),
                     ..WS90_868
                 },
-                FskProfile {
+                FskSettings {
                     whitening: Some(WhiteningConfig { initial: 0xffff }),
                     ..WS90_868
                 },
@@ -1393,7 +1393,7 @@ mod tests {
             radio.device.spi_mut().fail_opcode = Some(0x1d);
             assert_eq!(
                 radio
-                    .init_fsk(&FskProfile {
+                    .init_fsk(&FskSettings {
                         whitening: Some(WhiteningConfig::DEFAULT),
                         ..WS90_868
                     })
@@ -1407,7 +1407,7 @@ mod tests {
     fn supports_other_fixed_packet_lengths() {
         block_on(async {
             let mut radio = radio();
-            let profile = FskProfile {
+            let profile = FskSettings {
                 packet_length: 5,
                 ..WS90_868
             };
