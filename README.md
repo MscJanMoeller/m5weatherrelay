@@ -44,10 +44,15 @@ IRQ flags and errors are chip-specific. An SX1276 driver can use the same
 profile and receive concepts with a different constructor and implementation.
 It is **not implemented**: SX1276 supports different bandwidth steps (including
 125 kHz rather than SX1262's 117.3 kHz), so it requires a suitable profile.
-The current SX1262 driver supports 863-870 MHz, the GFSK receive bandwidths of
-the `sx1262` driver (the WS90 profile uses 117.3 kHz), a 3 V
+The current SX1262 driver supports the chip's 150-960 MHz range, the GFSK
+receive bandwidths of the `sx1262` driver (the WS90 profile uses 117.3 kHz), a 3 V
 TCXO, a two-byte sync word, fixed-length packets and disabled radio CRC and
-whitening. Unsupported settings are rejected.
+whitening. Unsupported settings are rejected. The image calibration uses the
+datasheet value of the ISM band containing the frequency (430-440, 470-510,
+779-787, 863-870 or 902-928 MHz); elsewhere it calibrates 4 MHz around the
+frequency as RadioLib does, which Semtech does not specify. Only 868.350 MHz
+is validated on hardware, and the board's matching network and antenna may
+limit the usable band.
 The receiver reuses the local [`sx1262`](../sx1262) async SPI device and FSK
 commands, with caller-managed BUSY timing. Driver failures preserve SPI errors
 and report the opcode and first byte of invalid responses.

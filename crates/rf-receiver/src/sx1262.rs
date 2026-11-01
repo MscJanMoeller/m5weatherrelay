@@ -39,6 +39,8 @@ const IRQ_NEW_PACKET: u16 = IRQ_SYNC | IRQ_RX_DONE;
 const IRQ_MASK: u16 = IRQ_RX_DONE | IRQ_PREAMBLE | IRQ_SYNC | IRQ_ERRORS;
 const IRQ_DIO1_MASK: u16 = IRQ_RX_DONE | IRQ_ERRORS;
 const BUSY_TIMEOUT_US: u32 = 250_000;
+// BUSY rises up to 600 ns (datasheet TSW) after NSS rises at the end of a write command.
+const BUSY_RISE_DELAY_US: u32 = 1;
 const TCXO_STARTUP_DELAY_STEPS: u32 = 320;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -139,8 +141,7 @@ where
     ) -> Result<InitStatus, Error<SPI::Error, BUSY::Error, IRQ::Error>> {
         let bandwidth =
             GfskBandwidth::from_hz(profile.rx_bandwidth_hz).ok_or(Error::InvalidProfile)?;
-        // The image calibration below only covers this band.
-        if !(863_000_000..=870_000_000).contains(&profile.frequency_hz)
+        if !RfFrequencyConfig::FREQUENCY_HZ.contains(&profile.frequency_hz)
             || !GfskModParams::BIT_RATE_BPS.contains(&profile.bit_rate)
             || !GfskModParams::FREQ_DEVIATION_HZ.contains(&profile.frequency_deviation_hz)
             || profile.preamble_bits < 16
@@ -181,7 +182,7 @@ where
         })
         .await?;
         self.execute_command(CalibrateImage {
-            config: ImageCalibConfig::BAND_863_870_MHZ,
+            config: ImageCalibConfig::for_frequency_hz(profile.frequency_hz),
         })
         .await?;
         let errors = self.execute_command(GetDeviceErrors).await?.errors.raw;
@@ -405,10 +406,10 @@ where
         &mut self,
         opcode: u8,
     ) -> Result<(), Error<SPI::Error, BUSY::Error, IRQ::Error>> {
-        self.delay.delay_us(1).await;
+        // Without this, BUSY could still be low from before the command and the wait would return early.
+        self.delay.delay_us(BUSY_RISE_DELAY_US).await;
         self.wait_while_busy().await?;
         let status = self.device.execute_command_async(GetRawStatus).await?;
-        self.delay.delay_us(1).await;
         if status == 0 || status == 0xff {
             return Err(Error::InvalidStatus(status));
         }
@@ -873,12 +874,47 @@ mod tests {
     }
 
     #[test]
+    fn calibrates_image_rejection_for_the_profile_frequency() {
+        block_on(async {
+            for (frequency, calibration) in [
+                (150_000_000, [35, 39]),
+                (315_000_000, [77, 81]),
+                (433_920_000, [0x6b, 0x6f]),
+                (868_350_000, [0xd7, 0xdb]),
+                (915_000_000, [0xe1, 0xe9]),
+                (960_000_000, [237, 243]),
+            ] {
+                let mut radio = radio();
+                radio
+                    .init_fsk(&FskProfile {
+                        frequency_hz: frequency,
+                        ..WS90_868
+                    })
+                    .await
+                    .unwrap();
+                assert!(
+                    radio.device.spi().commands.contains(&vec![
+                        0x98,
+                        calibration[0],
+                        calibration[1]
+                    ]),
+                    "{frequency} Hz"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn rejects_invalid_profiles_before_spi() {
         block_on(async {
             let mut radio = radio();
             for profile in [
                 FskProfile {
-                    frequency_hz: 433_920_000,
+                    frequency_hz: 149_999_999,
+                    ..WS90_868
+                },
+                FskProfile {
+                    frequency_hz: 960_000_001,
                     ..WS90_868
                 },
                 FskProfile {
