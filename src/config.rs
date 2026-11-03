@@ -1,5 +1,17 @@
 use crate::sensor_registry::{SensorProfile, SensorRegistry};
-use rf_sensor::ProfileSelectionError;
+use rf_sensor::model::DeviceId;
+use rf_sensor::{ProfileSelectionError, SensorModelKey};
+
+/// Set this to the complete identity printed when a sensor is first received.
+pub const HMI_HOME_SENSOR: Option<DeviceId> = Some(DeviceId {
+    model: SensorModelKey {
+        vendor: rf_ecowitt::VENDOR,
+        model_id: rf_ecowitt::WS90_MODEL_ID,
+    },
+    device: 0x01136c,
+});
+/// Set an appropriate model-specific expiry in milliseconds, if known.
+pub const HMI_STALE_AFTER_MS: Option<u64> = None;
 
 #[cfg(any(
     all(feature = "ws90-433", feature = "ws90-915"),

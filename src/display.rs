@@ -1,11 +1,68 @@
 use display_interface::AsyncWriteOnlyDataCommand;
+use embedded_graphics::{
+    mono_font::{
+        MonoFont, MonoTextStyleBuilder,
+        ascii::{FONT_5X7, FONT_10X20},
+    },
+    pixelcolor::BinaryColor,
+    prelude::*,
+    text::{Baseline, Text},
+};
 use ssd1306::{
     Ssd1306Async,
-    mode::{TerminalDisplaySizeAsync, TerminalModeAsync, TerminalModeError},
+    mode::{
+        BufferedGraphicsModeAsync, TerminalDisplaySizeAsync, TerminalModeAsync, TerminalModeError,
+    },
     prelude::DisplayRotation,
+    size::DisplaySize64x48,
 };
 
+use crate::hmi::Screen;
+
 pub const DISPLAY_ROTATION: DisplayRotation = DisplayRotation::Rotate180;
+
+pub async fn draw_screen<DI: AsyncWriteOnlyDataCommand>(
+    display: &mut Ssd1306Async<DI, DisplaySize64x48, BufferedGraphicsModeAsync<DisplaySize64x48>>,
+    screen: &Screen,
+) -> Result<(), display_interface::DisplayError> {
+    display.clear_buffer();
+    let spaced_font = MonoFont {
+        character_spacing: 1,
+        ..FONT_5X7
+    };
+    let small = MonoTextStyleBuilder::new()
+        .font(&spaced_font)
+        .text_color(BinaryColor::On)
+        .build();
+    let large = MonoTextStyleBuilder::new()
+        .font(&FONT_10X20)
+        .text_color(BinaryColor::On)
+        .build();
+    for (row, line) in screen.lines.iter().enumerate() {
+        Text::with_baseline(line, Point::new(0, row as i32 * 8), small, Baseline::Top)
+            .draw(display)
+            .unwrap();
+    }
+    if let Some(temperature) = &screen.home_temperature {
+        let style = if temperature.len() <= 6 { large } else { small };
+        Text::with_baseline(temperature, Point::new(0, 9), style, Baseline::Top)
+            .draw(display)
+            .unwrap();
+    }
+    // Networking is not implemented; this is the disconnected Wi-Fi symbol.
+    const WIFI_OFF: [u8; 8] = [
+        0b10000001, 0b01011110, 0b00100000, 0b00010100, 0b00001000, 0b00000100, 0b00000110,
+        0b00000001,
+    ];
+    for (y, row) in WIFI_OFF.iter().enumerate() {
+        for x in 0..8 {
+            if row & (0x80 >> x) != 0 {
+                display.set_pixel(56 + x, y as u32, true);
+            }
+        }
+    }
+    display.flush().await
+}
 
 pub async fn write_text<DI, SIZE>(
     display: &mut Ssd1306Async<DI, SIZE, TerminalModeAsync>,
@@ -101,6 +158,26 @@ mod tests {
             Err(TerminalModeError::InterfaceError(
                 DisplayError::BusWriteError
             ))
+        ));
+    }
+
+    #[test]
+    fn draws_a_screen_and_propagates_flush_errors() {
+        let state = Rc::new(RefCell::new(State::default()));
+        let mut display = Ssd1306Async::new(
+            MockInterface(state.clone()),
+            DisplaySize64x48,
+            DISPLAY_ROTATION,
+        )
+        .into_buffered_graphics_mode();
+        block_on(display.init()).unwrap();
+        let screen = crate::hmi::Hmi::new(None, None).screen(0);
+        block_on(draw_screen(&mut display, &screen)).unwrap();
+        assert!(state.borrow().data.iter().flatten().any(|byte| *byte != 0));
+        state.borrow_mut().fail_data = true;
+        assert!(matches!(
+            block_on(draw_screen(&mut display, &screen)),
+            Err(DisplayError::BusWriteError)
         ));
     }
 }

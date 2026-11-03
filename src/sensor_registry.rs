@@ -109,6 +109,41 @@ mod tests {
         assert_eq!(data.id, 0x01136c);
     }
 
+    #[test]
+    fn validated_ws90_packet_populates_all_hmi_pages() {
+        let registry = registry().unwrap();
+        let profile = registry
+            .select_profile(rf_ecowitt::profiles::WS90_868_ID)
+            .unwrap();
+        let decoded = profile
+            .decode(&ws90_packet(), |_| panic!("unexpected diagnostic"))
+            .unwrap();
+        let model = profile.models().next().unwrap();
+        let mut hmi = crate::hmi::Hmi::new(Some(decoded.data.device()), Some(1000));
+        hmi.update(&decoded.data, model.capabilities, 100).unwrap();
+        let home = hmi.screen(100);
+        assert_eq!(home.home_temperature.as_deref(), Some("9.0C"));
+        assert_eq!(home.lines[4], "H79%");
+        hmi.next();
+        let wind = hmi.screen(100);
+        assert_eq!(wind.lines[0], "WIND");
+        assert_eq!(wind.lines[1], "01 A0.9m/s");
+        assert_eq!(wind.lines[2], "01 G1.8m/s");
+        assert_eq!(wind.lines[3], "01 D75deg");
+        hmi.next();
+        let rain = hmi.screen(100);
+        assert_eq!(rain.lines[1], "01 R0.8mm");
+        assert_eq!(rain.lines[2], "01 rON");
+        assert_eq!(rain.lines[3], "01 L0lx");
+        assert_eq!(rain.lines[4], "01 U0.0");
+        hmi.next();
+        let power = hmi.screen(100);
+        assert_eq!(power.lines[1], "01 B2.20V");
+        assert_eq!(power.lines[2], "01 S2.10V");
+        hmi.next();
+        assert_eq!(hmi.screen(100).lines[0], "HOME 01 ");
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     enum CombinedData {
         Application(SensorData),

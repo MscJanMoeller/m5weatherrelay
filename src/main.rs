@@ -4,9 +4,12 @@
 use display_interface_spi::SPIInterface;
 use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either, select};
+use embassy_futures::{
+    join::join,
+    select::{Either, select},
+};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
-use embassy_time::{Delay, Duration, Ticker, Timer};
+use embassy_time::{Delay, Duration, Instant, Ticker, Timer};
 use esp_backtrace as _;
 use esp_hal::{
     gpio::{Input, InputConfig, Level, Output, OutputConfig},
@@ -16,15 +19,17 @@ use esp_hal::{
     timer::timg::TimerGroup,
 };
 use m5weatherrelay::{
-    config::selected_profile,
-    display::{DISPLAY_ROTATION, write_text},
-    hardware::{RADIO_BOARD, init_io_expander, set_radio_front_end},
+    config::{HMI_HOME_SENSOR, HMI_STALE_AFTER_MS, selected_profile},
+    display::{DISPLAY_ROTATION, draw_screen},
+    hardware::{RADIO_BOARD, button_pressed, init_io_expander, set_radio_front_end},
+    hmi::{Button, ButtonEvent, Hmi, Update},
     sensor_registry,
 };
 use rf_receiver::{
     Sx1262,
     sx1262::{Error as RadioError, IRQ_ERRORS, IRQ_RX_DONE},
 };
+use rf_sensor::model::Sample;
 use ssd1306::{Ssd1306Async, mode::DisplayConfigAsync, size::DisplaySize64x48};
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -72,12 +77,8 @@ async fn main(_spawner: Spawner) {
         DisplaySize64x48,
         DISPLAY_ROTATION,
     )
-    .into_terminal_mode();
+    .into_buffered_graphics_mode();
     display.init().await.expect("OLED initialization failed");
-    display.clear().await.expect("OLED clear failed");
-    write_text(&mut display, "M5\nWeather\nRelay")
-        .await
-        .expect("OLED write failed");
 
     esp_println::println!("M5WeatherRelay: Embassy and board buses initialized");
 
@@ -102,80 +103,151 @@ async fn main(_spawner: Spawner) {
         profile.fsk().frequency_hz
     );
 
-    let mut packets = 0u32;
-    let mut buffer = [0; u8::MAX as usize];
-    let mut heartbeat = Ticker::every(Duration::from_secs(10));
-    loop {
-        // The radio keeps DIO1 high until the IRQ flags are cleared, so no pin change is missed.
-        match select(radio.wait_for_irq_pin(), heartbeat.next()).await {
-            Either::First(result) => result.expect("SX1262 IRQ pin wait failed"),
-            Either::Second(()) => {
-                esp_println::println!(
-                    "SX1262: listening; {} packets, DIO1 {}",
-                    packets,
-                    radio.irq_pin_is_high().expect("SX1262 IRQ pin read failed")
-                );
-                continue;
-            }
-        }
-        let flags = radio
-            .read_irq_flags()
-            .await
-            .expect("SX1262 IRQ read failed");
-        if flags & IRQ_ERRORS != 0 {
-            esp_println::println!("SX1262: receive error IRQ 0x{:04x}", flags);
-            radio
-                .clear_irq_flags(flags)
-                .await
-                .expect("SX1262 IRQ clear failed");
-        } else if flags & IRQ_RX_DONE != 0 {
-            match radio.read_packet(&mut buffer).await {
-                Ok(packet) => {
-                    packets = packets.wrapping_add(1);
-                    let rssi = -packet.rssi_half_dbm;
-                    esp_println::print!(
-                        "SX1262: packet {} RSSI -{}.{} dBm IRQ 0x{:04x}: ",
+    let hmi =
+        Mutex::<CriticalSectionRawMutex, _>::new(Hmi::new(HMI_HOME_SENSOR, HMI_STALE_AFTER_MS));
+    let receiver = async {
+        let mut packets = 0u32;
+        let mut buffer = [0; u8::MAX as usize];
+        let mut heartbeat = Ticker::every(Duration::from_secs(10));
+        loop {
+            // The radio keeps DIO1 high until the IRQ flags are cleared, so no pin change is missed.
+            match select(radio.wait_for_irq_pin(), heartbeat.next()).await {
+                Either::First(result) => result.expect("SX1262 IRQ pin wait failed"),
+                Either::Second(()) => {
+                    esp_println::println!(
+                        "SX1262: listening; {} packets, DIO1 {}",
                         packets,
-                        rssi / 2,
-                        (rssi % 2) * 5,
-                        flags
+                        radio.irq_pin_is_high().expect("SX1262 IRQ pin read failed")
                     );
-                    for byte in &buffer[..packet.len] {
-                        esp_println::print!("{:02x}", byte);
-                    }
-                    esp_println::println!();
-                    match profile.decode(&buffer[..packet.len], |invalid| {
-                        esp_println::println!(
-                            "{} {}: invalid packet: {:?}",
-                            invalid.model.vendor,
-                            invalid.model.model_id,
-                            invalid.error
+                    continue;
+                }
+            }
+            let flags = radio
+                .read_irq_flags()
+                .await
+                .expect("SX1262 IRQ read failed");
+            if flags & IRQ_ERRORS != 0 {
+                esp_println::println!("SX1262: receive error IRQ 0x{:04x}", flags);
+                radio
+                    .clear_irq_flags(flags)
+                    .await
+                    .expect("SX1262 IRQ clear failed");
+            } else if flags & IRQ_RX_DONE != 0 {
+                match radio.read_packet(&mut buffer).await {
+                    Ok(packet) => {
+                        packets = packets.wrapping_add(1);
+                        let rssi = -packet.rssi_half_dbm;
+                        esp_println::print!(
+                            "SX1262: packet {} RSSI -{}.{} dBm IRQ 0x{:04x}: ",
+                            packets,
+                            rssi / 2,
+                            (rssi % 2) * 5,
+                            flags
                         );
-                    }) {
-                        Ok(decoded) => esp_println::println!(
-                            "{} {}: {:?}",
-                            decoded.model.vendor,
-                            decoded.model.model_id,
-                            decoded.data
-                        ),
-                        Err(error) => {
-                            esp_println::println!("{}: rejected packet: {:?}", profile.id(), error)
+                        for byte in &buffer[..packet.len] {
+                            esp_println::print!("{:02x}", byte);
+                        }
+                        esp_println::println!();
+                        match profile.decode(&buffer[..packet.len], |invalid| {
+                            esp_println::println!(
+                                "{} {}: invalid packet: {:?}",
+                                invalid.model.vendor,
+                                invalid.model.model_id,
+                                invalid.error
+                            );
+                        }) {
+                            Ok(decoded) => {
+                                esp_println::println!(
+                                    "{} {}: {:?}",
+                                    decoded.model.vendor,
+                                    decoded.model.model_id,
+                                    decoded.data
+                                );
+                                let model = profile
+                                    .models()
+                                    .find(|model| {
+                                        model.vendor == decoded.model.vendor
+                                            && model.model_id == decoded.model.model_id
+                                    })
+                                    .expect("decoded model missing from profile");
+                                let device = decoded.data.device();
+                                let update = {
+                                    let mut hmi = hmi.lock().await;
+                                    hmi.update(
+                                        &decoded.data,
+                                        model.capabilities,
+                                        Instant::now().as_millis(),
+                                    )
+                                };
+                                match update {
+                                    Ok(Update::Discovered(alias)) => esp_println::println!(
+                                        "HMI: {}{} = {} {} device 0x{:08x}",
+                                        char::from(alias[0]),
+                                        char::from(alias[1]),
+                                        device.model.vendor,
+                                        device.model.model_id,
+                                        device.device
+                                    ),
+                                    Ok(Update::Existing) => {}
+                                    Err(error) => esp_println::println!(
+                                        "HMI: rejected {} {} device 0x{:08x}: {:?}",
+                                        device.model.vendor,
+                                        device.model.model_id,
+                                        device.device,
+                                        error
+                                    ),
+                                }
+                            }
+                            Err(error) => {
+                                esp_println::println!(
+                                    "{}: rejected packet: {:?}",
+                                    profile.id(),
+                                    error
+                                )
+                            }
                         }
                     }
+                    Err(RadioError::InvalidPacketLength(length)) => {
+                        esp_println::println!("SX1262: unexpected packet length {}", length);
+                    }
+                    Err(RadioError::PacketOverrun) => {
+                        esp_println::println!("SX1262: packet dropped, next packet overwrote it");
+                    }
+                    Err(error) => panic!("SX1262 packet read failed: {:?}", error),
                 }
-                Err(RadioError::InvalidPacketLength(length)) => {
-                    esp_println::println!("SX1262: unexpected packet length {}", length);
-                }
-                Err(RadioError::PacketOverrun) => {
-                    esp_println::println!("SX1262: packet dropped, next packet overwrote it");
-                }
-                Err(error) => panic!("SX1262 packet read failed: {:?}", error),
+            } else {
+                panic!(
+                    "SX1262: IRQ pin asserted without receive IRQ: 0x{:04x}",
+                    flags
+                );
             }
-        } else {
-            panic!(
-                "SX1262: IRQ pin asserted without receive IRQ: 0x{:04x}",
-                flags
-            );
         }
-    }
+    };
+    let interface = async {
+        let mut button = Button::new();
+        let mut ticker = Ticker::every(Duration::from_millis(20));
+        let mut previous = None;
+        loop {
+            let now = Instant::now().as_millis();
+            let pressed = button_pressed(&mut i2c).expect("HMI button read failed");
+            let event = button.update(pressed, now);
+            let screen = {
+                let mut hmi = hmi.lock().await;
+                match event {
+                    Some(ButtonEvent::Short) => hmi.next(),
+                    Some(ButtonEvent::Long) => hmi.home(),
+                    None => {}
+                }
+                hmi.screen(now)
+            };
+            if previous.as_ref() != Some(&screen) {
+                draw_screen(&mut display, &screen)
+                    .await
+                    .expect("OLED update failed");
+                previous = Some(screen);
+            }
+            ticker.next().await;
+        }
+    };
+    join(receiver, interface).await;
 }

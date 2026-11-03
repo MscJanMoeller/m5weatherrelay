@@ -34,7 +34,8 @@ Current components:
 - "rf-sensor" — `no_std` chip-neutral FSK settings, decoder interface and allocation-free registry.
 - "rf-ecowitt" — Ecowitt family dispatch, WS90 packet validation, raw/physical measurements and regional radio profiles. WS80 and WS85 are candidates, not yet implemented.
 - "hardware" — Unit C6L I/O expander and RF board configuration.
-- "display" — OLED rotation and text output.
+- "display" — OLED rotation and HMI rendering.
+- "hmi" — volatile sensor snapshots, screen selection and button handling.
 - "main" — board GPIO and SPI setup, radio reception and logging.
 
 Planned components:
@@ -128,10 +129,143 @@ RF-envelope and profile compatibility validation before association.
 
 SX1262 → RF receiver → RF profile dispatch → vendor decoder → sensor state → ESPHome Native API → Home Assistant
 
-The receive, dispatch and WS90 decoding path is implemented; sensor state and
-the Home Assistant integration remain planned.
+The receive, dispatch and WS90 decoding path and HMI-local sensor snapshots are
+implemented; a shared sensor state service and the Home Assistant integration
+remain planned.
 
 Wi-Fi provisioning via Improv BLE; discovery via mDNS/DNS-SD.
+
+### HMI test implementation
+
+The Unit C6L has a 64 × 48 pixel monochrome OLED. The firmware maintains
+volatile HMI snapshots and polls the active-low user button on P0 of the
+PI4IOE5V6408 I/O expander. The pin and polarity follow the
+[board pin map](https://docs.m5stack.com/en/unit/Unit_C6L) and M5Unified's
+Unit C6L button handling. Screen rendering, button handling and concurrent
+radio reception have not yet been validated on hardware. Wi-Fi and the Home
+Assistant API are not implemented.
+
+#### Screen layout and measurements
+
+Reserve the upper-right 8 × 8 pixels for one connectivity symbol on every
+screen. A compact 5 × 7 pixel font with a one-pixel gap fits up to ten
+characters in each of the five remaining eight-pixel-high rows. Use the
+remaining header space for a short screen title. The home temperature uses
+a 10 × 20 pixel font when it fits; fall back to the compact font if the full
+value and unit do not fit. The examples below are schematic: `#` stands for
+the connectivity symbol, not a literal character.
+
+The home screen shows temperature and relative humidity from a **configured
+sensor**, identified by its complete model and transmitted device ID. Do not
+silently substitute another sensor or combine readings from different
+sensors. If no home sensor is configured, show `SET HOME`; if it has not
+reported or a measurement is unavailable, show `--` with the appropriate
+unit. Configure the identity in `src/config.rs`; there is no configuration UI.
+
+```text
+HOME 01  #
+  21.4C
+           <- temperature can occupy two rows
+H 63%
+```
+
+After home, short presses cycle through screens grouped by measurement type,
+across all discovered devices, in this order:
+
+| Group | Common measurement kinds | Display |
+|---|---|---|
+| Climate | `Temperature`, `Humidity` | Temperature in °C and relative humidity in %. Home already shows these for the configured sensor, so omit its climate rows here. |
+| Wind | `WindAverage`, `WindGust`, `WindDirection` | Average and gust in m/s; direction in degrees clockwise from north. Do not label the model-specific average as an instantaneous wind speed. |
+| Rain / sun | `RainTotal`, `RainActive`, `Light`, `UvIndex` | Reported rain counter in mm, rain detection on/off, illuminance in lux, and UV index. Do not call the counter a rate, daily total or corrected lifetime total, or illuminance solar irradiance. |
+| Power | `BatteryVoltage`, `SupercapVoltage` | Battery and supercapacitor voltages in V. |
+
+Use the model's declared capabilities to decide which rows exist, rather than
+the current packet's available values. Omit empty groups. This keeps screens
+stable when a value temporarily becomes unavailable or a sensor becomes
+stale. Pack up to five measurement rows per screen, keeping each group's
+devices and their measurements in a deterministic order; continue the group
+on another screen when needed. A device's rows may continue on the next
+screen, but every row repeats the device alias. Never combine different
+groups on one screen merely to fill space. Home is always present, even when
+there are no discovered devices.
+
+For example, one WS90 needs home plus one wind, one rain/sun and one power
+screen. Other sensors' climate rows and measurements are packed into the same
+group sequence rather than creating a separate set of screens per device:
+
+```text
+WIND     #    RAIN/SUN #    POWER    #
+01 A3.2m/s    01 R12.3mm    01 B1.32V
+01 G6.1m/s    01 rON        01 S4.85V
+01 D270deg    01 L12klx     02 B1.20V
+02 A1.4m/s    01 UV 5.2
+02 G2.8m/s
+```
+
+`A` and `G` mean average and gust, `D` direction, `R` rain counter, `L`
+illuminance, `U` UV index, `r` rain detection, `B` battery and `S`
+supercapacitor. Compact units such as `klx`
+may be used with the corresponding scaling. Format values to fit the row,
+reducing displayed precision when necessary; if a value still cannot be
+represented, show an explicit overflow indicator rather than clipping,
+wrapping, or presenting a misleading value.
+
+Each two-character alias identifies one complete `(model, device ID)` for the
+current session; reserve `01` for the configured home sensor and assign
+other aliases in discovery order without reusing them during that session.
+Use two base-36 characters (`01` through `ZZ`), reserving `00`.
+The test implementation supports up to 16 devices, reserving a slot for the
+configured home sensor if it has not yet been received; capacity failures
+are logged. The alias-to-full-identity mapping is printed in diagnostic output. Aliases may
+change after reboot, and transmitted IDs can collide or change on re-pairing;
+the HMI cannot distinguish devices that share the same complete RF identity.
+If alias capacity is exhausted, report it explicitly rather than assigning a
+duplicate. Do not reorder existing devices when another is discovered.
+
+An omitted value in a complete snapshot is unavailable immediately; do not
+keep an earlier reading as current. Track last receipt using a monotonic clock
+and apply a model-specific or explicitly configured expiry policy. The
+character immediately after each alias is a status slot: blank for a
+non-expired reading, `!` for stale, and `?` for unknown freshness. Once
+expired, replace values with `--`; if no expiry policy is available, mark
+freshness unknown rather than presenting it as confirmed fresh. For example,
+`01!A--m/s` is a stale wind average. Apply the same status convention on
+home; do not infer missing measurements or rain resets.
+
+#### Connectivity and button
+
+The implementation displays one slashed Wi-Fi symbol because networking is
+not yet implemented. Future connectivity support can use one status position:
+
+| Symbol | Meaning |
+|---|---|
+| Wi-Fi with slash | Wi-Fi is not connected, including when networking is not enabled. |
+| Wi-Fi | Wi-Fi is connected; no Home Assistant connection is confirmed. |
+| Home Assistant logomark | Wi-Fi is connected and a Home Assistant connection is confirmed. |
+
+The Home Assistant symbol requires a reliable way to identify an active Home Assistant session;
+an arbitrary ESPHome API client alone is not proof. Until that is available,
+the plain Wi-Fi symbol makes no claim that Home Assistant is disconnected.
+The logomark is not included in this test implementation. Its small-size
+readability and the [brand guidelines](https://contributors.home-assistant.io/brand/name-and-logo/)
+must be checked before use.
+
+Poll the button every 20 ms and debounce it for 30 ms. A debounced press shorter than
+800 ms advances once, wrapping from the last screen to home. Holding it for
+800 ms returns immediately to home; releasing that long press must not also
+advance a screen. A long press on home stays on home. Navigation must not
+block radio reception. If discovered capabilities change, preserve the
+currently shown semantic page where possible; otherwise return to home.
+
+#### Validation
+
+Host tests cover layout, row packing, formatting and overflow, multiple
+devices, an unconfigured or absent home sensor, unavailable and expired
+values, capacity, button timing, and display and expander errors. Confirm on
+hardware that the screen is readable, the button operates as expected, and
+display updates and button handling do not interfere with RF reception.
+Future connectivity support must test all states without treating an
+unverified API client as Home Assistant.
 
 ### WS90 packet and profile decisions
 

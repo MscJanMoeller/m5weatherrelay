@@ -18,10 +18,11 @@ The build requires the sibling checkout `..\sx1262` on the local
 `feature-sx1262-driver-improvements` branch. This branch is not published yet; a path
 dependency is not pinned by `Cargo.lock` and is not portable by itself.
 
-Connect the Unit C6L over USB. The OLED displays `M5`, `Weather` and `Relay`.
+Connect the Unit C6L over USB. The OLED displays the test HMI described below.
 The SX1262 listens at 868.350 MHz using 17.2 kbps FSK, 35 kHz deviation,
-117.3 kHz bandwidth, sync `2D D4` and fixed 64-byte packets. The firmware sleeps
-until the radio raises DIO1 and then reads the packet. Every 10 seconds
+117.3 kHz bandwidth, sync `2D D4` and fixed 64-byte packets. The receiver waits
+for the radio to raise DIO1 and then reads the packet, while the HMI runs
+concurrently. Every 10 seconds
 the monitor reports packet count and the DIO1 level; received packets are
 printed in hex with RSSI. Each packet is also passed through the Ecowitt
 decoder: valid WS90 values are printed with scaled-integer units and rejected
@@ -32,6 +33,44 @@ three reported packets are included in the decoder regression tests. The
 reported log did not specify the regional profile or independently verify
 measurement accuracy.
 Buzzer and RGB data pins are held low.
+
+### Testing the HMI
+
+The home screen is configured for the Ecowitt WS90 with ID `0x01136c`
+(70508). To select another sensor, receive a valid packet and note the line such as
+`HMI: 02 = Ecowitt ws90 device 0x0001136c` in the serial monitor. Set
+`HMI_HOME_SENSOR` in [config.rs](src/config.rs) to that sensor's complete
+identity, then rebuild and flash. For example, using the ID above:
+
+```rust
+pub const HMI_HOME_SENSOR: Option<DeviceId> = Some(DeviceId {
+    model: rf_sensor::SensorModelKey {
+        vendor: "Ecowitt",
+        model_id: "ws90",
+    },
+    device: 0x0001136c,
+});
+```
+
+Use the identity actually printed for your sensor; transmitted IDs can change
+after re-pairing. Until the configured sensor is received, home shows `--`.
+If `HMI_HOME_SENSOR` is set to `None`, home shows `SET HOME`.
+The button advances through climate, wind, rain/sun and power pages; hold it
+for at least 800 ms to return home. Pages are grouped by measurement type,
+with a two-character device alias on each row. Home is `01`; other devices
+receive aliases in discovery order, and the monitor prints the mapping.
+Home's temperature and humidity are not repeated on climate pages.
+
+The HMI stores at most 16 devices, reserving a slot for a configured home
+sensor; capacity errors are reported in the monitor. Omitted values display
+`--`. By default the `?` after the alias means freshness is unknown:
+`HMI_STALE_AFTER_MS` is `None`. Set an appropriate timeout for your sensors
+in [config.rs](src/config.rs) to show fresh values without `?` and replace
+expired values with `--` and `!`. The rain total is the sensor's counter,
+not a rain rate or daily total; `rON`/`rOFF` is its rain-detection bit.
+The connectivity symbol shows disconnected because Wi-Fi and Home Assistant
+are not implemented. Button operation, screen readability and concurrent RF
+reception still require testing on the actual device.
 
 The default is the hardware-tested 868.350 MHz profile. To select a different
 firmware-derived carrier, build with exactly one feature:
@@ -109,9 +148,10 @@ normalized to [0, 360), with out-of-range readings omitted. Device identity
 combines the registry model and transmitted ID; RF IDs can collide or change
 after re-pairing.
 
-Receive timestamps can be associated separately through `Received<T>`. Sensor
-state, monotonic expiry, rain-counter reset/rollover handling and ESPHome/Home
-Assistant mapping are not yet implemented. In particular, WS90 `RainTotal`
+Receive timestamps can be associated separately through `Received<T>`. The HMI
+keeps its own volatile snapshots and optional monotonic expiry; a shared sensor
+state service, rain-counter reset/rollover handling and ESPHome/Home Assistant
+mapping are not yet implemented. In particular, WS90 `RainTotal`
 is the reported counter, not a rate or a corrected lifetime total, and the
 rain-active bit is the sensor's own rain detection status.
 

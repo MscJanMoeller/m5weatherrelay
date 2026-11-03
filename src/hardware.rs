@@ -56,6 +56,12 @@ pub fn set_radio_front_end<I: I2c>(
     )
 }
 
+pub fn button_pressed<I: I2c>(i2c: &mut I) -> Result<bool, I::Error> {
+    let mut input = [0];
+    i2c.write_read(IO_EXPANDER_ADDRESS, &[0x0f], &mut input)?;
+    Ok(input[0] & 1 == 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,6 +74,7 @@ mod tests {
         fail_read: bool,
         fail_write_at: Option<usize>,
         output: u8,
+        input: u8,
         writes: Vec<(u8, u8)>,
     }
 
@@ -90,6 +97,7 @@ mod tests {
                     data[0] = match *register {
                         [IO_EXPANDER_ID] => self.id,
                         [0x05] => self.output,
+                        [0x0f] => self.input,
                         _ => panic!("unexpected register"),
                     };
                 }
@@ -196,6 +204,19 @@ mod tests {
             set_radio_front_end(&mut i2c, true, true),
             Err(ErrorKind::Other)
         );
+    }
+
+    #[test]
+    fn reads_the_active_low_button_and_propagates_errors() {
+        let mut i2c = MockI2c {
+            input: 1,
+            ..Default::default()
+        };
+        assert_eq!(button_pressed(&mut i2c), Ok(false));
+        i2c.input = 0xfe;
+        assert_eq!(button_pressed(&mut i2c), Ok(true));
+        i2c.fail_read = true;
+        assert_eq!(button_pressed(&mut i2c), Err(ErrorKind::Other));
     }
 
     #[test]

@@ -18,7 +18,9 @@ ws90-920 = []
 [dependencies]
 display-interface = "0.5"
 embedded-hal = "1"
+embedded-graphics = "0.8"
 embassy-futures = "0.1"
+heapless = "0.9"
 rf-ecowitt = { path = "crates/rf-ecowitt" }
 rf-receiver = { path = "crates/rf-receiver" }
 rf-sensor = { path = "crates/rf-sensor" }

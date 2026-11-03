@@ -3,4 +3,5 @@
 pub mod config;
 pub mod display;
 pub mod hardware;
+pub mod hmi;
 pub mod sensor_registry;
