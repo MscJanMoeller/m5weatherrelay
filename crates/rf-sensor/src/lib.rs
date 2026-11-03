@@ -1,31 +1,50 @@
 //! Chip-neutral RF profiles and allocation-free sensor registry.
 #![no_std]
 
+pub mod model;
 mod profile;
 pub use profile::{CrcConfig, CrcLength, FskSettings, WhiteningConfig};
 
 /// A decoder's packet recognition and validation result.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DecodeError<E> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeError {
     /// The packet is not recognized as belonging to this model.
     Unsupported,
     /// The packet was recognized but failed model-specific validation.
-    Invalid(E),
+    Invalid(InvalidReason),
     /// The recognized packet has an unexpected length for this model.
     UnexpectedLength { expected: usize, actual: usize },
 }
 
-impl<E> DecodeError<E> {
-    /// Convert a vendor-specific error while preserving framing and recognition errors.
-    pub fn map_invalid<F>(self, f: impl FnOnce(E) -> F) -> DecodeError<F> {
-        match self {
-            Self::Unsupported => DecodeError::Unsupported,
-            Self::Invalid(error) => DecodeError::Invalid(f(error)),
-            Self::UnexpectedLength { expected, actual } => {
-                DecodeError::UnexpectedLength { expected, actual }
-            }
-        }
-    }
+/// Details of a recognized but invalid packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidReason {
+    EmptyPayload,
+    /// Multiple packet lengths are accepted by the decoder.
+    InvalidLength {
+        expected: &'static [usize],
+        actual: usize,
+    },
+    InvalidField {
+        field: &'static str,
+        expected: u64,
+        actual: u64,
+    },
+    Integrity {
+        scope: &'static str,
+        /// Name of the failed check, such as "crc" or "checksum".
+        algorithm: &'static str,
+        expected: u64,
+        actual: u64,
+    },
+    NonzeroPadding {
+        offset: usize,
+        value: u8,
+    },
+    /// A named protocol-specific validation failure without structured fields.
+    Other {
+        description: &'static str,
+    },
 }
 
 /// Decode one byte-aligned payload after the radio has removed its sync word.
@@ -34,9 +53,8 @@ impl<E> DecodeError<E> {
 /// sensor data only after the packet's required integrity checks pass.
 pub trait Decoder {
     type SensorData;
-    type Error;
 
-    fn decode(&self, payload: &[u8]) -> Result<Self::SensorData, DecodeError<Self::Error>>;
+    fn decode(&self, payload: &[u8]) -> Result<Self::SensorData, DecodeError>;
 }
 
 /// A named receive configuration that can be registered independently of models.
@@ -47,26 +65,29 @@ pub struct RfProfileDefinition {
 }
 
 /// A sensor model, its vendor, compatible profiles, and typed decoder.
-pub struct SensorModel<S, E> {
+pub struct SensorModel<S> {
     /// Vendor name. Together with `model_id`, this is the registry key.
     pub vendor: &'static str,
     /// Model identifier within this vendor, distinct from an individual device ID.
     pub model_id: &'static str,
     /// IDs of explicitly compatible RF profiles.
     pub profiles: &'static [&'static str],
-    pub decode: fn(&[u8]) -> Result<S, DecodeError<E>>,
+    /// Unique measurements this model supports, independently of any packet.
+    pub capabilities: &'static [model::MeasurementKind],
+    pub decode: fn(&[u8]) -> Result<S, DecodeError>,
 }
 
-impl<S, E> SensorModel<S, E> {
-    /// Preserve a vendor's model metadata while adapting its decoder result types.
-    pub const fn with_decoder<T, F>(
+impl<S> SensorModel<S> {
+    /// Preserve a vendor's model metadata while adapting its decoded data type.
+    pub const fn with_decoder<T>(
         &self,
-        decode: fn(&[u8]) -> Result<T, DecodeError<F>>,
-    ) -> SensorModel<T, F> {
+        decode: fn(&[u8]) -> Result<T, DecodeError>,
+    ) -> SensorModel<T> {
         SensorModel {
             vendor: self.vendor,
             model_id: self.model_id,
             profiles: self.profiles,
+            capabilities: self.capabilities,
             decode,
         }
     }
@@ -76,10 +97,11 @@ impl<S, E> SensorModel<S, E> {
 ///
 /// The capacities are the number of profiles, models, and models per profile.
 /// Register profiles before models. Multi-vendor applications can use enums
-/// and adapter functions to unify vendor-specific results and errors.
-pub struct Registry<S: 'static, E: 'static, const P: usize, const M: usize, const L: usize> {
-    profiles: [Option<RfProfile<S, E, L>>; P],
-    models: [Option<&'static SensorModel<S, E>>; M],
+/// and adapter functions to unify vendor-specific results. All registered
+/// decoders use the shared [`DecodeError`] type.
+pub struct Registry<S: 'static, const P: usize, const M: usize, const L: usize> {
+    profiles: [Option<RfProfile<S, L>>; P],
+    models: [Option<&'static SensorModel<S>>; M],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +126,10 @@ pub enum RegistrationError {
         model: SensorModelKey,
         profile_id: &'static str,
     },
+    DuplicateMeasurementCapability {
+        model: SensorModelKey,
+        measurement: model::MeasurementKind,
+    },
     ProfileCapacityExceeded {
         capacity: usize,
     },
@@ -117,7 +143,7 @@ pub enum RegistrationError {
 }
 
 /// Registry identity of a sensor model, not an individual device.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SensorModelKey {
     pub vendor: &'static str,
     pub model_id: &'static str,
@@ -132,9 +158,9 @@ pub struct Decoded<S> {
 
 /// A recognized but invalid packet from one candidate decoder.
 #[derive(Debug, PartialEq, Eq)]
-pub struct InvalidPacket<E> {
+pub struct InvalidPacket {
     pub model: SensorModelKey,
-    pub error: DecodeError<E>,
+    pub error: DecodeError,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,7 +180,7 @@ pub enum DispatchError {
     },
 }
 
-impl<S, E, const P: usize, const M: usize, const L: usize> Registry<S, E, P, M, L> {
+impl<S, const P: usize, const M: usize, const L: usize> Registry<S, P, M, L> {
     pub const fn new() -> Self {
         Self {
             profiles: [const { None }; P],
@@ -165,7 +191,7 @@ impl<S, E, const P: usize, const M: usize, const L: usize> Registry<S, E, P, M, 
     /// Build a registry from static definitions, registering profiles first.
     pub fn from_definitions(
         profiles: &'static [RfProfileDefinition],
-        models: &'static [SensorModel<S, E>],
+        models: &'static [SensorModel<S>],
     ) -> Result<Self, RegistrationError> {
         let mut registry = Self::new();
         for profile in profiles {
@@ -177,11 +203,11 @@ impl<S, E, const P: usize, const M: usize, const L: usize> Registry<S, E, P, M, 
         Ok(registry)
     }
 
-    pub fn profiles(&self) -> impl Iterator<Item = &RfProfile<S, E, L>> {
+    pub fn profiles(&self) -> impl Iterator<Item = &RfProfile<S, L>> {
         self.profiles.iter().flatten()
     }
 
-    pub fn models(&self) -> impl Iterator<Item = &SensorModel<S, E>> {
+    pub fn models(&self) -> impl Iterator<Item = &SensorModel<S>> {
         self.models.iter().flatten().copied()
     }
 
@@ -207,7 +233,7 @@ impl<S, E, const P: usize, const M: usize, const L: usize> Registry<S, E, P, M, 
     /// Add a model to every referenced profile, or leave the registry unchanged.
     pub fn register_model(
         &mut self,
-        model: &'static SensorModel<S, E>,
+        model: &'static SensorModel<S>,
     ) -> Result<(), RegistrationError> {
         let key = SensorModelKey {
             vendor: model.vendor,
@@ -221,6 +247,14 @@ impl<S, E, const P: usize, const M: usize, const L: usize> Registry<S, E, P, M, 
                 vendor: model.vendor,
                 model_id: model.model_id,
             });
+        }
+        for (index, &measurement) in model.capabilities.iter().enumerate() {
+            if model.capabilities[..index].contains(&measurement) {
+                return Err(RegistrationError::DuplicateMeasurementCapability {
+                    model: key,
+                    measurement,
+                });
+            }
         }
         for (index, &reference) in model.profiles.iter().enumerate() {
             if model.profiles[..index].contains(&reference) {
@@ -267,14 +301,14 @@ impl<S, E, const P: usize, const M: usize, const L: usize> Registry<S, E, P, M, 
     pub fn select_profile(
         &self,
         profile_id: &str,
-    ) -> Result<&RfProfile<S, E, L>, ProfileSelectionError> {
+    ) -> Result<&RfProfile<S, L>, ProfileSelectionError> {
         self.profiles()
             .find(|profile| profile.id() == profile_id)
             .ok_or(ProfileSelectionError::ProfileNotFound)
     }
 }
 
-impl<S, E, const P: usize, const M: usize, const L: usize> Default for Registry<S, E, P, M, L> {
+impl<S, const P: usize, const M: usize, const L: usize> Default for Registry<S, P, M, L> {
     fn default() -> Self {
         Self::new()
     }
@@ -282,12 +316,12 @@ impl<S, E, const P: usize, const M: usize, const L: usize> Default for Registry<
 
 /// A registered profile and its compatible decoders.
 /// Configure the receiver with its settings before decoding post-sync bytes.
-pub struct RfProfile<S: 'static, E: 'static, const L: usize> {
+pub struct RfProfile<S: 'static, const L: usize> {
     definition: &'static RfProfileDefinition,
-    models: [Option<&'static SensorModel<S, E>>; L],
+    models: [Option<&'static SensorModel<S>>; L],
 }
 
-impl<S, E, const L: usize> RfProfile<S, E, L> {
+impl<S, const L: usize> RfProfile<S, L> {
     pub fn id(&self) -> &'static str {
         self.definition.id
     }
@@ -296,7 +330,7 @@ impl<S, E, const L: usize> RfProfile<S, E, L> {
         &self.definition.fsk
     }
 
-    pub fn models(&self) -> impl Iterator<Item = &SensorModel<S, E>> {
+    pub fn models(&self) -> impl Iterator<Item = &SensorModel<S>> {
         self.models.iter().flatten().copied()
     }
 
@@ -307,7 +341,7 @@ impl<S, E, const L: usize> RfProfile<S, E, L> {
     pub fn decode(
         &self,
         payload: &[u8],
-        mut on_invalid: impl FnMut(InvalidPacket<E>),
+        mut on_invalid: impl FnMut(InvalidPacket),
     ) -> Result<Decoded<S>, DispatchError> {
         let expected = usize::from(self.fsk().packet_length);
         if payload.len() != expected {

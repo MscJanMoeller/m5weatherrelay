@@ -65,9 +65,10 @@ the receiver and its packets to `decode()`.
 
 The [application registry](src/sensor_registry.rs) owns composition: vendor
 crates supply profile definitions, models, and decoders, while the application
-provides combined data and error enums and adapts each model decoder.
-`SensorModel::with_decoder` retains vendor metadata and compatible profile IDs
-when adapting its result types. Register all needed profile definitions before
+provides a combined data enum and adapts each model decoder's successful result.
+Registry decoders return a shared `DecodeError`, so error enums and conversions
+are not needed in application composition. `SensorModel::with_decoder` retains
+vendor metadata and compatible profile IDs when adapting its data type. Register all needed profile definitions before
 their models; a shared profile is registered once, and models may reference it
 only when their complete RF settings and framing are known to be compatible.
 The three capacities are profiles, models, and model links **per profile**.
@@ -78,16 +79,41 @@ The active profile validates packet length and distinguishes unsupported,
 invalid and ambiguous packets. A callback reports every recognized invalid
 candidate, including when another decoder succeeds. Multiple valid decoders
 produce an ambiguity error rather than publishing an arbitrary result.
+The common error includes structured integrity, length, field and padding
+details; integrity check names are static strings (such as `crc` and
+`checksum`), and vendor-specific failures can also carry a static description.
+Direct WS90 decoding retains its detailed `ws90::Error`.
 This does not provide simultaneous reception on different radio profiles.
 `rf-ecowitt` currently decodes WS90 only; WS80 and WS85 are future candidates
 whose RF envelopes and profile compatibility still need verification.
 A 32-byte WS90 core is validated independently; 39-byte records
 and 64-byte RF envelopes require both CRC/checksum layers, and the latter
-also require zero padding. Invalid sentinels are omitted, unknown extension
-bytes are retained, and pressure remains raw because its scale is unverified.
+also require zero padding. Invalid sentinels become `None` in the decoded data,
+unknown extension bytes are retained, and pressure remains raw because its scale
+is unverified.
 The standalone WS90 decoder accepts those three lengths; the active profile
 requires the 64-byte length of its configured RF profile.
 See [design notes](doc/design.md) for packet provenance and parser alternatives.
+
+`rf-sensor::model` also defines an allocation-free, vendor-neutral `Sample`
+projection. A registry model lists its measurement capabilities before any
+packet is received. Each available measurement has a stable kind and a canonical
+unit (`Unit::None` for no unit). Numeric/binary classification is separate from
+the unit, and checked constructors reject mismatched or non-finite values.
+A sample is a complete
+snapshot: a supported measurement omitted from it is unavailable in that
+snapshot. Protocols that send partial updates require state assembly before
+providing a sample. The WS90 projection leaves pressure, unknown fields and
+the raw firmware byte on the protocol-specific data. Wind direction is
+normalized to [0, 360), with out-of-range readings omitted. Device identity
+combines the registry model and transmitted ID; RF IDs can collide or change
+after re-pairing.
+
+Receive timestamps can be associated separately through `Received<T>`. Sensor
+state, monotonic expiry, rain-counter reset/rollover handling and ESPHome/Home
+Assistant mapping are not yet implemented. In particular, WS90 `RainTotal`
+is the reported counter, not a rate or a corrected lifetime total, and the
+rain-active bit is the sensor's own rain detection status.
 
 The receive-only `rf-receiver` crate uses async embedded-hal SPI,
 GPIO waits and delays, and follows RadioLib concepts (`init_fsk`,

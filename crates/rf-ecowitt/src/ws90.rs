@@ -2,6 +2,11 @@
 //!
 //! See `doc/design.md` for packet provenance and validation constraints.
 
+use rf_sensor::{
+    SensorModelKey,
+    model::{Attribute, DeviceId, Measurement, MeasurementKind, Sample},
+};
+
 pub const FAMILY: u8 = 0x90;
 pub const CORE_LEN: usize = 32;
 pub const RECORD_LEN: usize = 39;
@@ -50,6 +55,89 @@ pub struct SensorData {
     /// Uninterpreted extension; only present when its trailer was validated.
     pub extension: Option<[u8; 5]>,
     pub integrity: Integrity,
+}
+
+/// Measurements supported by the WS90, even when a packet reports a sentinel.
+pub static MEASUREMENT_CAPABILITIES: [MeasurementKind; 11] = [
+    MeasurementKind::Temperature,
+    MeasurementKind::Humidity,
+    MeasurementKind::WindAverage,
+    MeasurementKind::WindGust,
+    MeasurementKind::WindDirection,
+    MeasurementKind::Light,
+    MeasurementKind::UvIndex,
+    MeasurementKind::RainTotal,
+    MeasurementKind::BatteryVoltage,
+    MeasurementKind::SupercapVoltage,
+    MeasurementKind::RainActive,
+];
+
+impl Sample for SensorData {
+    fn device(&self) -> DeviceId {
+        DeviceId {
+            model: SensorModelKey {
+                vendor: crate::VENDOR,
+                model_id: crate::WS90_MODEL_ID,
+            },
+            device: self.id,
+        }
+    }
+
+    fn for_each_measurement(&self, f: &mut impl FnMut(Measurement)) {
+        let direction = match self.wind_direction_degrees {
+            Some(0..=359) => self.wind_direction_degrees.map(f32::from),
+            Some(360) => Some(0.0),
+            _ => None,
+        };
+        let values = [
+            (
+                MeasurementKind::Temperature,
+                self.temperature_tenths_c.map(|v| f32::from(v) / 10.0),
+            ),
+            (
+                MeasurementKind::Humidity,
+                self.humidity_percent.map(f32::from),
+            ),
+            (
+                MeasurementKind::WindAverage,
+                self.wind_average_tenths_m_s.map(|v| f32::from(v) / 10.0),
+            ),
+            (
+                MeasurementKind::WindGust,
+                self.wind_gust_tenths_m_s.map(|v| f32::from(v) / 10.0),
+            ),
+            (MeasurementKind::WindDirection, direction),
+            (MeasurementKind::Light, self.light_lux.map(|v| v as f32)),
+            (
+                MeasurementKind::UvIndex,
+                self.uv_index_tenths.map(|v| f32::from(v) / 10.0),
+            ),
+            (
+                MeasurementKind::RainTotal,
+                Some(f32::from(self.rain_total_tenths_mm) / 10.0),
+            ),
+            (
+                MeasurementKind::BatteryVoltage,
+                Some(f32::from(self.battery_mv) / 1000.0),
+            ),
+            (
+                MeasurementKind::SupercapVoltage,
+                Some(f32::from(self.supercap_tenths_v) / 10.0),
+            ),
+        ];
+        for (kind, value) in values {
+            if let Some(value) = value {
+                f(Measurement::numeric(kind, value)
+                    .expect("WS90 numeric measurements must have numeric kinds and finite values"));
+            }
+        }
+        f(
+            Measurement::binary(MeasurementKind::RainActive, self.rain_started)
+                .expect("WS90 rain status must have a binary kind"),
+        );
+    }
+
+    fn for_each_attribute<'a>(&'a self, _f: &mut impl FnMut(Attribute<'a>)) {}
 }
 
 /// Decode exactly a 32-byte core, 39-byte record, or padded 64-byte RF payload.

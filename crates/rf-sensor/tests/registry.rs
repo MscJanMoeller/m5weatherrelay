@@ -1,5 +1,6 @@
+use rf_sensor::model::MeasurementKind;
 use rf_sensor::{
-    DecodeError, Decoded, Decoder, DispatchError, FskSettings, InvalidPacket,
+    DecodeError, Decoded, Decoder, DispatchError, FskSettings, InvalidPacket, InvalidReason,
     ProfileSelectionError, RegistrationError, Registry, RfProfileDefinition, SensorModel,
     SensorModelKey,
 };
@@ -11,12 +12,15 @@ enum SensorData {
     Other(u8),
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum SensorError {
-    VendorA,
-    VendorB,
-    Other,
-}
+const INVALID_A: InvalidReason = InvalidReason::Other {
+    description: "vendor A",
+};
+const INVALID_B: InvalidReason = InvalidReason::Other {
+    description: "vendor B",
+};
+const INVALID_OTHER: InvalidReason = InvalidReason::Other {
+    description: "other",
+};
 
 const fn fsk() -> FskSettings<'static> {
     FskSettings {
@@ -50,12 +54,10 @@ struct VendorA;
 
 impl Decoder for VendorA {
     type SensorData = u8;
-    type Error = ();
-
-    fn decode(&self, bytes: &[u8]) -> Result<u8, DecodeError<()>> {
+    fn decode(&self, bytes: &[u8]) -> Result<u8, DecodeError> {
         match bytes {
             [0xa0 | 0xdd, value] => Ok(*value),
-            [0xee | 0xef, _] => Err(DecodeError::Invalid(())),
+            [0xee | 0xef, _] => Err(DecodeError::Invalid(INVALID_A)),
             _ => Err(DecodeError::Unsupported),
         }
     }
@@ -65,78 +67,75 @@ struct VendorB;
 
 impl Decoder for VendorB {
     type SensorData = u8;
-    type Error = ();
-
-    fn decode(&self, bytes: &[u8]) -> Result<u8, DecodeError<()>> {
+    fn decode(&self, bytes: &[u8]) -> Result<u8, DecodeError> {
         match bytes {
             [0xb0 | 0xdd | 0xef, value] => Ok(*value),
-            [0xee, _] => Err(DecodeError::Invalid(())),
+            [0xee, _] => Err(DecodeError::Invalid(INVALID_B)),
             _ => Err(DecodeError::Unsupported),
         }
     }
 }
 
-fn decode_a(bytes: &[u8]) -> Result<SensorData, DecodeError<SensorError>> {
-    VendorA
-        .decode(bytes)
-        .map(SensorData::VendorA)
-        .map_err(|error| error.map_invalid(|()| SensorError::VendorA))
+fn decode_a(bytes: &[u8]) -> Result<SensorData, DecodeError> {
+    VendorA.decode(bytes).map(SensorData::VendorA)
 }
 
-fn decode_b(bytes: &[u8]) -> Result<SensorData, DecodeError<SensorError>> {
-    VendorB
-        .decode(bytes)
-        .map(SensorData::VendorB)
-        .map_err(|error| error.map_invalid(|()| SensorError::VendorB))
+fn decode_b(bytes: &[u8]) -> Result<SensorData, DecodeError> {
+    VendorB.decode(bytes).map(SensorData::VendorB)
 }
 
-fn decode_other(bytes: &[u8]) -> Result<SensorData, DecodeError<SensorError>> {
+fn decode_other(bytes: &[u8]) -> Result<SensorData, DecodeError> {
     match bytes {
         [0xc0 | 0xdd, value] => Ok(SensorData::Other(*value)),
         _ => Err(DecodeError::Unsupported),
     }
 }
 
-fn decode_invalid(bytes: &[u8]) -> Result<SensorData, DecodeError<SensorError>> {
+fn decode_invalid(bytes: &[u8]) -> Result<SensorData, DecodeError> {
     match bytes {
-        [0xdd, _] => Err(DecodeError::Invalid(SensorError::Other)),
+        [0xdd, _] => Err(DecodeError::Invalid(INVALID_OTHER)),
         _ => Err(DecodeError::Unsupported),
     }
 }
 
-static MODELS: [SensorModel<SensorData, SensorError>; 5] = [
+static MODELS: [SensorModel<SensorData>; 5] = [
     SensorModel {
         vendor: "Vendor A",
         model_id: "shared-model",
         profiles: &["shared"],
+        capabilities: &[],
         decode: decode_a,
     },
     SensorModel {
         vendor: "Vendor B",
         model_id: "shared-model",
         profiles: &["shared"],
+        capabilities: &[],
         decode: decode_b,
     },
     SensorModel {
         vendor: "Vendor C",
         model_id: "other-model",
         profiles: &["other"],
+        capabilities: &[],
         decode: decode_other,
     },
     SensorModel {
         vendor: "Vendor D",
         model_id: "overlap",
         profiles: &["shared"],
+        capabilities: &[],
         decode: decode_other,
     },
     SensorModel {
         vendor: "Vendor E",
         model_id: "invalid",
         profiles: &["shared"],
+        capabilities: &[],
         decode: decode_invalid,
     },
 ];
-type TestRegistry = Registry<SensorData, SensorError, 2, 5, 5>;
+type TestRegistry = Registry<SensorData, 2, 5, 5>;
 
 fn registry() -> TestRegistry {
     TestRegistry::from_definitions(&PROFILES, &MODELS).unwrap()
@@ -237,11 +236,11 @@ fn distinguishes_unsupported_framing_and_all_invalid_candidates() {
         [
             InvalidPacket {
                 model: model("Vendor A", "shared-model"),
-                error: DecodeError::Invalid(SensorError::VendorA)
+                error: DecodeError::Invalid(INVALID_A)
             },
             InvalidPacket {
                 model: model("Vendor B", "shared-model"),
-                error: DecodeError::Invalid(SensorError::VendorB)
+                error: DecodeError::Invalid(INVALID_B)
             },
         ]
     );
@@ -263,7 +262,45 @@ fn reports_invalid_candidates_even_when_another_model_succeeds() {
         invalid,
         [InvalidPacket {
             model: model("Vendor A", "shared-model"),
-            error: DecodeError::Invalid(SensorError::VendorA),
+            error: DecodeError::Invalid(INVALID_A),
+        }]
+    );
+}
+
+#[test]
+fn reports_decoder_length_error_with_model_identity() {
+    fn wrong_length(_bytes: &[u8]) -> Result<SensorData, DecodeError> {
+        Err(DecodeError::UnexpectedLength {
+            expected: 3,
+            actual: 2,
+        })
+    }
+    static MODEL: SensorModel<SensorData> = SensorModel {
+        vendor: "Vendor A",
+        model_id: "length-check",
+        profiles: &["shared"],
+        capabilities: &[],
+        decode: wrong_length,
+    };
+    let mut registry = Registry::<SensorData, 1, 1, 1>::new();
+    registry.register_profile(&PROFILES[0]).unwrap();
+    registry.register_model(&MODEL).unwrap();
+    let mut invalid = Vec::new();
+    assert_eq!(
+        registry
+            .select_profile("shared")
+            .unwrap()
+            .decode(&[0xa0, 0], |item| invalid.push(item)),
+        Err(DispatchError::Invalid { count: 1 })
+    );
+    assert_eq!(
+        invalid,
+        [InvalidPacket {
+            model: model("Vendor A", "length-check"),
+            error: DecodeError::UnexpectedLength {
+                expected: 3,
+                actual: 2,
+            },
         }]
     );
 }
@@ -285,28 +322,8 @@ fn reports_ambiguous_matches_without_returning_data_and_still_reports_errors() {
         invalid,
         [InvalidPacket {
             model: model("Vendor E", "invalid"),
-            error: DecodeError::Invalid(SensorError::Other),
+            error: DecodeError::Invalid(INVALID_OTHER),
         }]
-    );
-}
-
-#[test]
-fn maps_vendor_errors_without_losing_other_failures() {
-    let unrelated: DecodeError<()> = DecodeError::Unsupported;
-    assert_eq!(
-        unrelated.map_invalid(|()| SensorError::VendorA),
-        DecodeError::Unsupported
-    );
-    let framing: DecodeError<()> = DecodeError::UnexpectedLength {
-        expected: 2,
-        actual: 1,
-    };
-    assert_eq!(
-        framing.map_invalid(|()| SensorError::VendorA),
-        DecodeError::UnexpectedLength {
-            expected: 2,
-            actual: 1
-        }
     );
 }
 
@@ -335,17 +352,19 @@ fn rejects_duplicate_profile_ids_and_duplicate_vendor_model_keys() {
             fsk: fsk(),
         },
     ];
-    static DUPLICATE_MODELS: [SensorModel<SensorData, SensorError>; 2] = [
+    static DUPLICATE_MODELS: [SensorModel<SensorData>; 2] = [
         SensorModel {
             vendor: "Vendor A",
             model_id: "same",
             profiles: &["shared"],
+            capabilities: &[],
             decode: decode_a,
         },
         SensorModel {
             vendor: "Vendor A",
             model_id: "same",
             profiles: &["other"],
+            capabilities: &[],
             decode: decode_b,
         },
     ];
@@ -364,16 +383,18 @@ fn rejects_duplicate_profile_ids_and_duplicate_vendor_model_keys() {
 
 #[test]
 fn rejects_unknown_or_repeated_model_profile_references() {
-    static UNKNOWN: [SensorModel<SensorData, SensorError>; 1] = [SensorModel {
+    static UNKNOWN: [SensorModel<SensorData>; 1] = [SensorModel {
         vendor: "Vendor A",
         model_id: "model",
         profiles: &["missing"],
+        capabilities: &[],
         decode: decode_a,
     }];
-    static REPEATED: [SensorModel<SensorData, SensorError>; 1] = [SensorModel {
+    static REPEATED: [SensorModel<SensorData>; 1] = [SensorModel {
         vendor: "Vendor A",
         model_id: "model",
         profiles: &["shared", "shared"],
+        capabilities: &[],
         decode: decode_a,
     }];
     assert!(matches!(
@@ -398,16 +419,43 @@ fn rejects_unknown_or_repeated_model_profile_references() {
     ));
 }
 
-static BOTH_PROFILES: SensorModel<SensorData, SensorError> = SensorModel {
+#[test]
+fn rejects_duplicate_measurement_capabilities_without_registering_the_model() {
+    const TEMPERATURE: MeasurementKind = MeasurementKind::Temperature;
+    static DUPLICATE: SensorModel<SensorData> = SensorModel {
+        vendor: "Vendor A",
+        model_id: "duplicate-capability",
+        profiles: &["shared"],
+        capabilities: &[TEMPERATURE, TEMPERATURE],
+        decode: decode_a,
+    };
+    let mut registry = Registry::<SensorData, 2, 1, 1>::new();
+    registry.register_profile(&PROFILES[0]).unwrap();
+    assert_eq!(
+        registry.register_model(&DUPLICATE),
+        Err(RegistrationError::DuplicateMeasurementCapability {
+            model: model("Vendor A", "duplicate-capability"),
+            measurement: TEMPERATURE,
+        })
+    );
+    assert_eq!(registry.models().count(), 0);
+    assert_eq!(
+        registry.select_profile("shared").unwrap().models().count(),
+        0
+    );
+}
+
+static BOTH_PROFILES: SensorModel<SensorData> = SensorModel {
     vendor: "Vendor F",
     model_id: "both",
     profiles: &["shared", "other"],
+    capabilities: &[],
     decode: decode_b,
 };
 
 #[test]
 fn registration_adds_model_links_to_each_compatible_profile() {
-    let mut registry = Registry::<SensorData, SensorError, 2, 3, 2>::new();
+    let mut registry = Registry::<SensorData, 2, 3, 2>::new();
     registry.register_profile(&PROFILES[0]).unwrap();
     registry.register_profile(&PROFILES[1]).unwrap();
     assert_eq!(
@@ -441,19 +489,21 @@ fn registration_adds_model_links_to_each_compatible_profile() {
 
 #[test]
 fn registration_failure_does_not_add_partial_model_links() {
-    static MISSING: SensorModel<SensorData, SensorError> = SensorModel {
+    static MISSING: SensorModel<SensorData> = SensorModel {
         vendor: "Vendor F",
         model_id: "missing",
         profiles: &["shared", "missing"],
+        capabilities: &[],
         decode: decode_a,
     };
-    static REPEATED: SensorModel<SensorData, SensorError> = SensorModel {
+    static REPEATED: SensorModel<SensorData> = SensorModel {
         vendor: "Vendor F",
         model_id: "repeated",
         profiles: &["shared", "shared"],
+        capabilities: &[],
         decode: decode_a,
     };
-    let mut registry = Registry::<SensorData, SensorError, 2, 3, 1>::new();
+    let mut registry = Registry::<SensorData, 2, 3, 1>::new();
     registry.register_profile(&PROFILES[0]).unwrap();
     registry.register_profile(&PROFILES[1]).unwrap();
     registry.register_model(&MODELS[2]).unwrap();
@@ -496,7 +546,7 @@ fn registration_failure_does_not_add_partial_model_links() {
 
 #[test]
 fn registration_reports_capacity_without_mutating_the_registry() {
-    let mut registry = Registry::<SensorData, SensorError, 1, 1, 2>::new();
+    let mut registry = Registry::<SensorData, 1, 1, 2>::new();
     registry.register_profile(&PROFILES[0]).unwrap();
     assert_eq!(
         registry.register_profile(&PROFILES[1]),
@@ -518,13 +568,13 @@ fn registration_reports_capacity_without_mutating_the_registry() {
         1
     );
 
-    let mut empty = Registry::<SensorData, SensorError, 0, 0, 0>::new();
+    let mut empty = Registry::<SensorData, 0, 0, 0>::new();
     assert_eq!(
         empty.register_profile(&PROFILES[0]),
         Err(RegistrationError::ProfileCapacityExceeded { capacity: 0 })
     );
 
-    let mut no_links = Registry::<SensorData, SensorError, 1, 1, 0>::new();
+    let mut no_links = Registry::<SensorData, 1, 1, 0>::new();
     no_links.register_profile(&PROFILES[0]).unwrap();
     assert_eq!(
         no_links.register_model(&MODELS[0]),

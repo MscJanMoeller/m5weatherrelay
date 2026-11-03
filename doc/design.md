@@ -66,12 +66,37 @@ error, even when another model succeeds or several models match. Multiple valid
 matches are ambiguous and are not published as one arbitrary model. Registration
 rejects duplicate profile or model keys and missing or duplicate model-profile
 references. Registry entries share a typed result; the application combines
-vendors using enums and adapter functions. `SensorModel::with_decoder`
-preserves vendor-supplied metadata when adapting decoder types. Vendor crates
+vendor data using enums and adapter functions. Registry decoders use the common
+`DecodeError`: unsupported packets, per-decoder framing errors and recognized
+invalid packets remain distinct, with structured details for common failure
+types. Model identity is carried by the diagnostic callback. Vendor adapters
+convert model-specific errors at the registry boundary; direct WS90 decoding
+retains `ws90::Error`. `SensorModel::with_decoder` preserves vendor-supplied
+metadata when adapting data types. Vendor crates
 provide their profile definitions and models, not the application registry.
 Register a shared profile definition once and associate models with it only
 after verifying their RF settings and framing. Neither vendor crates nor
 `rf-sensor` depend on radio drivers.
+
+Each model declares unique static measurement capabilities through its registry
+entry; registration rejects duplicates without changing the registry. A `Sample`
+exposes a complete snapshot of the available measurements using a shared kind
+for numeric and binary values. Kinds fix the canonical unit (`Unit::None` when
+unitless) and separately classify the value as numeric or binary. Checked
+constructors reject kind/value mismatches and non-finite numeric values. A
+supported kind omitted from a snapshot is unavailable rather than retaining
+an earlier value. Protocols that send partial updates require state assembly
+before providing a snapshot. The application must separately expire stale
+values using a monotonic clock. `Received<T>` optionally associates Unix
+receive time with decoded data without requiring the decoder to know the clock.
+Measurement identity combines model, transmitted device ID and kind;
+transmitted IDs can collide or change on re-pairing.
+
+The WS90 projection reports the sensor's rain-detection bit and uncorrected
+accumulated-rain counter. It does not infer a rate, reset, or rollover policy.
+The firmware byte and pressure remain protocol-specific until their
+interpretation is established. ESPHome/HA device classes, statistics policies,
+entity registration and value validation belong to the future mapping layer.
 
 The receiver must be configured with the selected profile before decoding.
 The SX1262 receiver currently accepts one fixed packet length per profile. A

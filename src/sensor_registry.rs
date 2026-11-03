@@ -1,5 +1,6 @@
 //! Application-level composition of RF profiles and sensor decoders.
 
+use rf_sensor::model::{Attribute, DeviceId, Measurement, Sample};
 use rf_sensor::{DecodeError, RegistrationError, Registry, RfProfile, SensorModel};
 
 /// Sensor data from all vendors enabled by the application.
@@ -8,29 +9,41 @@ pub enum SensorData {
     Ecowitt(rf_ecowitt::SensorData),
 }
 
-/// Vendor-specific errors from the enabled sensor decoders.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Error {
-    Ecowitt(rf_ecowitt::Error),
+impl Sample for SensorData {
+    fn device(&self) -> DeviceId {
+        match self {
+            Self::Ecowitt(data) => data.device(),
+        }
+    }
+
+    fn for_each_measurement(&self, f: &mut impl FnMut(Measurement)) {
+        match self {
+            Self::Ecowitt(data) => data.for_each_measurement(f),
+        }
+    }
+
+    fn for_each_attribute<'a>(&'a self, f: &mut impl FnMut(Attribute<'a>)) {
+        match self {
+            Self::Ecowitt(data) => data.for_each_attribute(f),
+        }
+    }
 }
 
-fn decode_ecowitt_ws90(payload: &[u8]) -> Result<SensorData, DecodeError<Error>> {
-    (rf_ecowitt::WS90_MODEL.decode)(payload)
-        .map(SensorData::Ecowitt)
-        .map_err(|error| error.map_invalid(Error::Ecowitt))
+fn decode_ecowitt_ws90(payload: &[u8]) -> Result<SensorData, DecodeError> {
+    (rf_ecowitt::WS90_MODEL.decode)(payload).map(SensorData::Ecowitt)
 }
 
-const WS90_MODEL: SensorModel<SensorData, Error> =
+const WS90_MODEL: SensorModel<SensorData> =
     rf_ecowitt::WS90_MODEL.with_decoder(decode_ecowitt_ws90);
-static MODELS: [SensorModel<SensorData, Error>; 1] = [WS90_MODEL];
+static MODELS: [SensorModel<SensorData>; 1] = [WS90_MODEL];
 
 const PROFILE_CAPACITY: usize = rf_ecowitt::profiles::RF_PROFILES.len();
 const MODEL_CAPACITY: usize = MODELS.len();
 const MODELS_PER_PROFILE: usize = MODEL_CAPACITY;
 
 pub type SensorRegistry =
-    Registry<SensorData, Error, PROFILE_CAPACITY, MODEL_CAPACITY, MODELS_PER_PROFILE>;
-pub type SensorProfile = RfProfile<SensorData, Error, MODELS_PER_PROFILE>;
+    Registry<SensorData, PROFILE_CAPACITY, MODEL_CAPACITY, MODELS_PER_PROFILE>;
+pub type SensorProfile = RfProfile<SensorData, MODELS_PER_PROFILE>;
 
 /// Assemble enabled vendor profiles and adapted models without heap allocation.
 pub fn registry() -> Result<SensorRegistry, RegistrationError> {
@@ -47,7 +60,7 @@ pub fn registry() -> Result<SensorRegistry, RegistrationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rf_sensor::{Decoded, DispatchError, SensorModelKey};
+    use rf_sensor::{Decoded, DispatchError, InvalidReason, SensorModelKey};
 
     const CAPTURE: [u8; 39] = [
         0x90, 0x01, 0x13, 0x6c, 0x00, 0x00, 0x6e, 0x89, 0xea, 0x4f, 0x09, 0x4b, 0x12, 0x00, 0x3f,
@@ -71,6 +84,7 @@ mod tests {
         assert_eq!(model.vendor, rf_ecowitt::WS90_MODEL.vendor);
         assert_eq!(model.model_id, rf_ecowitt::WS90_MODEL.model_id);
         assert_eq!(model.profiles, rf_ecowitt::WS90_MODEL.profiles);
+        assert_eq!(model.capabilities, rf_ecowitt::WS90_MODEL.capabilities);
 
         let decoded = profile
             .decode(&ws90_packet(), |_| panic!("unexpected diagnostic"))
@@ -82,6 +96,15 @@ mod tests {
                 model_id: rf_ecowitt::WS90_MODEL_ID,
             }
         );
+        let mut projected = Vec::new();
+        decoded
+            .data
+            .for_each_measurement(&mut |item| projected.push(item));
+        assert_eq!(
+            projected.iter().map(Measurement::kind).collect::<Vec<_>>(),
+            model.capabilities
+        );
+        assert_eq!(decoded.data.device().model, decoded.model);
         let SensorData::Ecowitt(rf_ecowitt::SensorData::Ws90(data)) = decoded.data;
         assert_eq!(data.id, 0x01136c);
     }
@@ -92,47 +115,40 @@ mod tests {
         Other(u8),
     }
 
-    #[derive(Debug, PartialEq, Eq)]
-    enum CombinedError {
-        Application(Error),
-        Other,
+    fn decode_application(payload: &[u8]) -> Result<CombinedData, DecodeError> {
+        (WS90_MODEL.decode)(payload).map(CombinedData::Application)
     }
 
-    fn decode_application(payload: &[u8]) -> Result<CombinedData, DecodeError<CombinedError>> {
-        (WS90_MODEL.decode)(payload)
-            .map(CombinedData::Application)
-            .map_err(|error| error.map_invalid(CombinedError::Application))
-    }
-
-    fn decode_other_vendor(payload: &[u8]) -> Result<u8, DecodeError<()>> {
+    fn decode_other_vendor(payload: &[u8]) -> Result<u8, DecodeError> {
         match payload {
             [0xb0, value, ..] => Ok(*value),
-            [0xb1, ..] => Err(DecodeError::Invalid(())),
+            [0xb1, ..] => Err(DecodeError::Invalid(InvalidReason::Other {
+                description: "other vendor invalid packet",
+            })),
             _ => Err(DecodeError::Unsupported),
         }
     }
 
-    fn adapt_other_vendor(payload: &[u8]) -> Result<CombinedData, DecodeError<CombinedError>> {
-        (OTHER_VENDOR_MODEL.decode)(payload)
-            .map(CombinedData::Other)
-            .map_err(|error| error.map_invalid(|()| CombinedError::Other))
+    fn adapt_other_vendor(payload: &[u8]) -> Result<CombinedData, DecodeError> {
+        (OTHER_VENDOR_MODEL.decode)(payload).map(CombinedData::Other)
     }
 
-    const OTHER_VENDOR_MODEL: SensorModel<u8, ()> = SensorModel {
+    const OTHER_VENDOR_MODEL: SensorModel<u8> = SensorModel {
         vendor: "Example vendor",
         model_id: "example",
         profiles: &[rf_ecowitt::profiles::WS90_868_ID],
+        capabilities: &[],
         decode: decode_other_vendor,
     };
 
-    static COMBINED_MODELS: [SensorModel<CombinedData, CombinedError>; 2] = [
+    static COMBINED_MODELS: [SensorModel<CombinedData>; 2] = [
         WS90_MODEL.with_decoder(decode_application),
         OTHER_VENDOR_MODEL.with_decoder(adapt_other_vendor),
     ];
 
     #[test]
     fn application_model_composes_with_another_vendor_on_a_shared_profile() {
-        let registry = Registry::<CombinedData, CombinedError, 4, 2, 2>::from_definitions(
+        let registry = Registry::<CombinedData, 4, 2, 2>::from_definitions(
             &rf_ecowitt::profiles::RF_PROFILES,
             &COMBINED_MODELS,
         )
@@ -179,7 +195,12 @@ mod tests {
             Err(DispatchError::Invalid { count: 1 })
         );
         assert_eq!(invalid[0].model.vendor, "Example vendor");
-        assert_eq!(invalid[0].error, DecodeError::Invalid(CombinedError::Other));
+        assert_eq!(
+            invalid[0].error,
+            DecodeError::Invalid(InvalidReason::Other {
+                description: "other vendor invalid packet",
+            })
+        );
 
         let mut corrupt = ws90_packet();
         corrupt[30] ^= 1;
@@ -191,9 +212,11 @@ mod tests {
         assert_eq!(invalid[0].model.vendor, rf_ecowitt::VENDOR);
         assert!(matches!(
             invalid[0].error,
-            DecodeError::Invalid(CombinedError::Application(Error::Ecowitt(
-                rf_ecowitt::Error::Ws90(rf_ecowitt::ws90::Error::CoreCrc { .. })
-            )))
+            DecodeError::Invalid(InvalidReason::Integrity {
+                scope: "core",
+                algorithm: "crc",
+                ..
+            })
         ));
     }
 }
